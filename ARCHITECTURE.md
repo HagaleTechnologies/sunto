@@ -1,4 +1,4 @@
-# wiki-kit — Architecture
+# sunto — Architecture
 
 Four layers, strictly separable: the **per-repo wiki** (the data), the **kit**
 (schema + tooling + skills, one repo, reused everywhere), the **export
@@ -66,12 +66,12 @@ restates spec constants would manufacture that bug class continuously. Hence
 the hard rule: **wiki pages point at normative artifacts, never restate their
 values.**
 
-## 2. The kit (one repo: `ricettario`)
+## 2. The kit (sunto repo)
 
 A Claude Code plugin plus a small deterministic tool:
 
 ```
-ricettario/
+sunto/
 ├── plugin/
 │   ├── skills/
 │   │   ├── wiki-init/       # bootstrap a repo: survey → seed pages → INDEX → stanza
@@ -89,7 +89,7 @@ ricettario/
 
 Why a plugin, not per-repo copies: skills and lint evolve; N repos must not
 fork the discipline. Repos own only their *data* (`wiki/`); behavior updates
-land once in ricettario. `wiki-lint` is vendorable into CI via a pinned
+land once in sunto. `wiki-lint` is vendorable into CI via a pinned
 checkout or a copy-on-init with a version stamp — SPEC §6 fixes the
 determinism contract so versions interoperate.
 
@@ -121,7 +121,7 @@ main), chunked and embedded into pgvector by the brain's indexer, retrieval
 via `home/embed` + `home/rerank`, trust `trusted` *because the PR gate earns
 it* (DATA-CONTRACTS §F).
 
-A wiki-kit wiki is the same artifact class with the same discipline, so the
+A sunto wiki is the same artifact class with the same discipline, so the
 mesh is a federation, not a bridge:
 
 **Each repo wiki is a read-only vault shard.** Harbor's indexer grows one
@@ -137,19 +137,21 @@ source type, `repo-wiki`, configured with a list of manifest locations
   closed-repo knowledge (it's argus-scoped); the open/closed rule constrains
   *copying between repos*, which federation never does — harbor reads, it
   doesn't replicate content into other wikis.
-- **Trust mapping is harbor's policy, wiki-kit's data:** the manifest carries
+- **Trust mapping is harbor's policy, sunto's data:** the manifest carries
   `maintainer` (human/agent/mixed) and `status` per page. Recommended harbor
   default: repo-wiki pages ingest as `trusted` (they live in operator-reviewed
   git history — the commit gate is argus's PR gate), with `status: stale`
   pages down-ranked or excluded, and a per-repo override if some repo's wiki
   is ever loosely reviewed. The decision sits in harbor's indexer config, not
-  in wiki-kit — producer describes, consumer decides.
+  in sunto — producer describes, consumer decides. The trust classification is
+  harbor's policy; the boundary is defined in harbor DATA-CONTRACTS §F (see
+  harbor issue #9).
 - **Write-back follows INV-3's pattern:** harbor agents never write repo wikis
   directly; a harbor-side improvement becomes a PR against the repo (exactly
   `vault.propose_edit`). Claude Code agents in-repo write directly — they're
   in the operator lane, and lint + commit review is their gate.
 
-Direction of dependency: wiki-kit knows *nothing* about harbor beyond keeping
+Direction of dependency: sunto knows *nothing* about harbor beyond keeping
 the manifest self-describing and versioned (`wiki-manifest/v1`). Harbor's
 indexer depends on the manifest schema. If harbor's design shifts, the
 federation config changes; the eleven wikis don't.

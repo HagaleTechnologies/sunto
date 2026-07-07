@@ -1,8 +1,6 @@
-# wiki-kit — Agentic Knowledge Wiki for Every Repo and Project
+# sunto — Agentic Knowledge Wiki for Every Repo and Project
 
-*Proposal, 2026-07-07. Working name `wiki-kit`; suggested repo name **`ricettario`**
-(recipe book — the pantry is `dispensa`, the accumulated knowledge is the recipe
-collection). Tony's call.*
+*Proposal, 2026-07-07. System name: **sunto** (summary/digest; decided 2026-07-07).*
 
 ## What this is
 
@@ -74,11 +72,11 @@ distilled.** The wiki holds only the second kind.
    (`repo-wiki`), routes manifest visibility onto its namespaces, applies its
    own trust policy, and re-embeds incrementally by content hash. Write-back
    from harbor happens only as PRs (its existing `propose_edit`/INV-3
-   pattern). Dependency points one way: wiki-kit never learns about harbor.
+   pattern). Dependency points one way: sunto never learns about harbor.
 
 ## Rollout shape
 
-- **Claude Code repos:** wiki-kit ships as a Claude Code plugin (skills +
+- **Claude Code repos:** sunto ships as a Claude Code plugin (skills +
   templates + lint). Per-repo adoption = run `/wiki-init`, commit, add the
   CLAUDE.md stanza. Knowledge then accrues via `/wiki-update` after substantive
   work and a periodic gardener pass (`/wiki-verify` + `/wiki-gc`).

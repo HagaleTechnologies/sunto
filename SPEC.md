@@ -1,4 +1,4 @@
-# wiki-kit — Specification (v1)
+# sunto — Specification (v1)
 
 **Status: normative.** Implement from this; design decisions are made. The
 manifest schema and frontmatter grammar are versioned contracts — changing
@@ -189,6 +189,8 @@ excluded) so a `verified` re-stamp doesn't force consumers to re-embed.
 Consumers (harbor `repo-wiki` indexer, anything else) MUST key on
 `(repo, id)` and re-process only on `hash` change; MUST honor `status` and
 effective visibility; MUST treat all fields beyond these as informational.
+Consumers assign trust; the manifest supplies provenance (`verified.commit`,
+content hashes) so they can.
 
 ## 9. Skill behavioral contracts
 
@@ -234,10 +236,13 @@ into docs/ if normative — the wiki points, it never restates). The wiki is
 descriptive and always loses conflicts with code and docs/.
 ```
 
+Fleet rule: CLAUDE.md ≤ ~100 lines; this stanza is 5 lines — exactly fits.
+The stanza must not be lengthened.
+
 ## 11. Versioning
 
 `wiki-manifest/v1`, `wiki-config/v1`, and the frontmatter grammar version
-together as **wiki-kit v1**. Additive optional fields are minor; anything a
+together as **sunto v1**. Additive optional fields are minor; anything a
 v1 consumer would misread is v2, and manifests carry the schema string so
 consumers can refuse what they don't understand. `wiki-lint --version`
 reports the spec version it enforces.
