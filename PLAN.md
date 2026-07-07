@@ -1,10 +1,10 @@
-# wiki-kit — Implementation & Rollout Plan
+# sunto — Implementation & Rollout Plan
 
 Opus implements; this plan is ordered so every phase leaves something useful
 even if the next never happens. SPEC.md is normative throughout; where the
 plan and spec disagree, the spec wins.
 
-## P0 — Kit foundation (`ricettario` repo)
+## P0 — Kit foundation (sunto repo)
 
 Scaffold the repo (`plugin/`, `bin/wiki-lint`, `templates/`, `schema/`,
 `fixtures/`). Implement `wiki-lint` per SPEC §6 with the restricted
@@ -46,11 +46,18 @@ iterate before rolling out).
 
 ## P2 — Fleet rollout
 
-Order: **coppa, pancetta, cqdx** (the dispensa triangle — their wikis get
-`interface` pages citing Q/ADR ids), then **propagation, dit, watchfinder,
-health, sbn, panino, remy**, finally **dispensa itself** (a small wiki
-digesting the contract landscape — who owes whom what — is legitimately
-descriptive). Per repo: `/wiki-init`, review, commit, CI job.
+Order (updated 2026-07-07 to current reality):
+
+- **Pilot (now):** pancetta — Track 10 `docs/DECISIONS/` digests have landed;
+  the wiki distills those rather than untangling old CLAUDE.md blobs.
+- **Wave 2:** coppa, cqdx (the dispensa triangle — their wikis get `interface`
+  pages citing Q/ADR ids).
+- **Wave 3:** dit, skimmer, propagation, panino, watchfinder, BeatScope, sbn.
+- **Harbor:** thin/optional — its `docs/` are already normative; the wiki
+  would hold only implementation gotchas and decision digests.
+- **dispensa:** not a candidate — it *is* normative source; nothing to distill.
+
+Per repo: `/wiki-init`, review, commit, CI job.
 
 Migration sweep, once per repo: long-lived knowledge currently squatting in
 CLAUDE.md (e.g. skimmer's Watterson correction bullet) moves to a wiki page;
@@ -105,11 +112,11 @@ chunk set.
 - **Staleness theater** (pages perpetually `stale`, never adjudicated): the
   gardener cadence exists precisely for this; `stale` count is the one metric
   worth glancing at monthly.
-- **Fork drift of lint across repos:** single source in ricettario, version
+- **Fork drift of lint across repos:** single source in sunto, version
   stamp, WK-L10 keeps manifests honest even if versions skew.
 - **Harbor design shifts:** federation is one indexer config away from off;
   wikis lose nothing (ARCHITECTURE layer separation). If the mesh proves
-  awkward in practice, the fallback the operator already blessed — wiki-kit
+  awkward in practice, the fallback the operator already blessed — sunto
   standalone — is the P0–P3 system unchanged.
 
 ## Fable/Opus split
