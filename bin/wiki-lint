@@ -264,11 +264,16 @@ def parse_wiki_toml(text: str):
         m = re.match(r"^([a-z_]+)\s*=\s*(.+)$", line)
         if not m:
             continue
-        key, val = m.group(1), m.group(2).strip()
-        if val.startswith('"') and val.endswith('"'):
-            val = val[1:-1]
-        elif val.isdigit():
-            val = int(val)
+        key, raw_val = m.group(1), m.group(2).strip()
+        if raw_val.startswith('"'):
+            # quoted string: extract up to closing quote, ignore trailing comment
+            end = raw_val.find('"', 1)
+            val = raw_val[1:end] if end != -1 else raw_val[1:]
+        else:
+            # unquoted: strip inline comment
+            val = raw_val.split("#")[0].strip()
+            if val.isdigit():
+                val = int(val)
         cfg[key] = val
     return cfg
 
@@ -493,7 +498,11 @@ def run_checks(wiki_dir: Path, repo_root: Path):
     id_status = {pg.id: pg.status for pg in pages if pg.id}
     for pg in pages:
         targets = set(pg.fields.get("links", []) or [])
-        targets |= set(LINK_RE.findall(pg.body))
+        # Strip fenced code blocks and inline code spans before scanning for
+        # [[links]] so that example usages in backticks don't trip WK-L5.
+        body_no_code = re.sub(r"```.*?```", "", pg.body, flags=re.DOTALL)
+        body_no_code = re.sub(r"`[^`]+`", "", body_no_code)
+        targets |= set(LINK_RE.findall(body_no_code))
         for t in sorted(targets):
             if t not in id_status:
                 add("WK-L5", "error", str(pg.path), f"broken link target: {t}")
