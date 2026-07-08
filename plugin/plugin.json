@@ -1,0 +1,12 @@
+{
+  "name": "sunto",
+  "description": "Agentic knowledge wiki for a repo — init/update/verify/gc/export skills backed by the deterministic wiki-lint tool (wiki-kit v1).",
+  "version": "1.0.0",
+  "author": {
+    "name": "Tony Hagale",
+    "email": "tony@hagale.net"
+  },
+  "homepage": "https://github.com/HagaleTechnologies/sunto",
+  "repository": "https://github.com/HagaleTechnologies/sunto",
+  "license": "MIT OR Apache-2.0"
+}
