@@ -1,0 +1,6 @@
+schema = "wiki-config/v1"
+repo = "<repo-name>"
+visibility = "public"        # public | private
+# optional overrides:
+# max_pages = 100
+# export_max_bytes = 400000

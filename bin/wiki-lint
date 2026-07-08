@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""sunto wiki-lint — deterministic lint + manifest/index generator for repo wikis.
+
+Stdlib only, Python >= 3.10. Implements the sunto SPEC (wiki-kit v1):
+frontmatter grammar (SPEC 2.1), checks WK-L1..L10 + WK-W11..W12 (SPEC 6),
+manifest (SPEC 8) and INDEX (SPEC 4) generation.
+
+Exit codes: 0 clean, 1 violations (any WK-L*), 2 usage/IO error.
+
+Determinism: given an identical tree + HEAD the byte output is stable. Ordering
+is lexicographic by id; the manifest is serialized with sorted keys, 2-space
+indent and a trailing newline; generated_at/head_commit derive from HEAD's
+commit (never wall clock).
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SPEC_VERSION = "wiki-kit v1"
+
+KIND_ORDER = [
+    "overview",
+    "subsystem",
+    "concept",
+    "decision-digest",
+    "gotcha",
+    "runbook",
+    "interface",
+    "question",
+]
+KINDS = set(KIND_ORDER)
+STATUSES = {"current", "stale", "draft", "deprecated"}
+MAINTAINERS = {"agent", "human", "mixed"}
+VISIBILITIES = {"repo", "public-safe"}
+
+REQUIRED_FIELDS = {"id", "title", "kind", "status", "maintainer", "sources", "verified"}
+LIST_FIELDS = {"sources", "links"}
+SCALAR_FIELDS = {"id", "title", "kind", "status", "maintainer", "locked", "visibility"}
+KNOWN_FIELDS = SCALAR_FIELDS | LIST_FIELDS | {"verified"}
+
+ID_RE = re.compile(r"^[a-z0-9-]{3,64}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+LINK_RE = re.compile(r"\[\[([a-z0-9-]+)\]\]")
+INDEX_LINK_RE = re.compile(r"\]\(pages/([a-z0-9-]+)\.md\)")
+
+MAX_BODY_LINES = 120
+MAX_BODY_BYTES = 8 * 1024
+MAX_PAGES = 100
+SOFT_PAGE_WARN = 60
+STALE_DAYS = 90
+
+# Values that would smuggle in richer YAML than the restricted grammar allows.
+FORBIDDEN_SCALAR_STARTS = tuple('"\'[{&*!|>@`%?')
+
+
+class Finding:
+    __slots__ = ("code", "level", "path", "message")
+
+    def __init__(self, code, level, path, message):
+        self.code = code
+        self.level = level  # "error" | "warning"
+        self.path = path
+        self.message = message
+
+    def sort_key(self):
+        return (self.code, self.path or "", self.message)
+
+    def as_dict(self):
+        return {
+            "code": self.code,
+            "level": self.level,
+            "path": self.path,
+            "message": self.message,
+        }
+
+
+# --------------------------------------------------------------------------
+# Frontmatter parser (restricted grammar, SPEC 2.1)
+# --------------------------------------------------------------------------
+
+def _valid_scalar(value: str) -> bool:
+    if value == "":
+        return False
+    if value != value.strip():
+        return False
+    if value.startswith(FORBIDDEN_SCALAR_STARTS):
+        return False
+    return True
+
+
+def parse_frontmatter(text: str):
+    """Return (fields, body, errors).
+
+    fields maps key -> str | list[str] | {"commit":.., "date":..}. Anything
+    outside the restricted grammar produces an error string; the parser never
+    falls back to a full YAML parser.
+    """
+    errors = []
+    lines = text.split("\n")
+    if not lines or lines[0].rstrip("\r") != "---":
+        return {}, text, ["missing opening --- frontmatter delimiter"]
+
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\r") == "---":
+            end = i
+            break
+    if end is None:
+        return {}, "", ["unterminated frontmatter (no closing ---)"]
+
+    fm = [ln.rstrip("\r") for ln in lines[1:end]]
+    body = "\n".join(lines[end + 1:])
+
+    fields = {}
+    i = 0
+    n = len(fm)
+    while i < n:
+        line = fm[i]
+        if line.strip() == "":
+            errors.append(f"blank line not allowed in frontmatter (line {i + 2})")
+            i += 1
+            continue
+        if line[0] in " \t":
+            errors.append(f"unexpected indentation: {line!r}")
+            i += 1
+            continue
+        m = re.match(r"^([a-z][a-z0-9_]*):(.*)$", line)
+        if not m:
+            errors.append(f"malformed frontmatter line: {line!r}")
+            i += 1
+            continue
+        key, rest = m.group(1), m.group(2)
+        if key in fields:
+            errors.append(f"duplicate key: {key}")
+
+        if rest == "":
+            # opener: either a list, or the verified nested map.
+            if key == "verified":
+                child = {}
+                consumed = 0
+                for j in range(i + 1, min(i + 3, n)):
+                    cm = re.match(r"^  (commit|date): (.+)$", fm[j])
+                    if not cm:
+                        break
+                    ck, cv = cm.group(1), cm.group(2)
+                    if not _valid_scalar(cv):
+                        errors.append(f"verified.{ck}: invalid scalar {cv!r}")
+                    child[ck] = cv
+                    consumed += 1
+                if set(child) != {"commit", "date"}:
+                    errors.append("verified: must have exactly commit and date")
+                fields["verified"] = child
+                i += 1 + consumed
+                continue
+            if key in LIST_FIELDS:
+                items = []
+                j = i + 1
+                while j < n:
+                    im = re.match(r"^  - (.+)$", fm[j])
+                    if not im:
+                        break
+                    item = im.group(1)
+                    if not _valid_scalar(item):
+                        errors.append(f"{key}: invalid list item {item!r}")
+                    items.append(item)
+                    j += 1
+                fields[key] = items
+                i = j
+                continue
+            errors.append(f"{key}: empty value not allowed")
+            i += 1
+            continue
+
+        # scalar value; grammar requires exactly one space after the colon.
+        if not rest.startswith(" ") or rest.startswith("  "):
+            errors.append(f"scalar {key!r} must be 'key: value' with one space")
+            i += 1
+            continue
+        value = rest[1:]
+        if not _valid_scalar(value):
+            errors.append(f"{key}: invalid scalar {value!r}")
+        fields[key] = value
+        i += 1
+
+    return fields, body, errors
+
+
+# --------------------------------------------------------------------------
+# git helpers
+# --------------------------------------------------------------------------
+
+def git(repo_root: Path, *args) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return 127, ""
+    return p.returncode, p.stdout
+
+
+def repo_root_of(path: Path) -> Path:
+    rc, out = git(path if path.is_dir() else path.parent, "rev-parse", "--show-toplevel")
+    if rc == 0 and out.strip():
+        return Path(out.strip())
+    return path if path.is_dir() else path.parent
+
+
+def head_short(repo_root: Path) -> str:
+    rc, out = git(repo_root, "rev-parse", "--short", "HEAD")
+    return out.strip() if rc == 0 else ""
+
+
+def head_iso(repo_root: Path) -> str:
+    rc, out = git(repo_root, "show", "-s", "--format=%ct", "HEAD")
+    if rc != 0 or not out.strip():
+        return ""
+    ts = int(out.strip().split()[0])
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def head_date(repo_root: Path):
+    rc, out = git(repo_root, "show", "-s", "--format=%ct", "HEAD")
+    if rc != 0 or not out.strip():
+        return None
+    ts = int(out.strip().split()[0])
+    return datetime.fromtimestamp(ts, tz=timezone.utc).date()
+
+
+def commit_resolves(repo_root: Path, commit: str) -> bool:
+    if not commit:
+        return False
+    rc, _ = git(repo_root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+    return rc == 0
+
+
+def diff_names(repo_root: Path, commit: str):
+    rc, out = git(repo_root, "diff", "--name-only", f"{commit}..HEAD")
+    if rc != 0:
+        return None
+    return [l for l in out.split("\n") if l]
+
+
+# --------------------------------------------------------------------------
+# wiki.toml (restricted TOML subset)
+# --------------------------------------------------------------------------
+
+def parse_wiki_toml(text: str):
+    cfg = {}
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([a-z_]+)\s*=\s*(.+)$", line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
+        elif val.isdigit():
+            val = int(val)
+        cfg[key] = val
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# Page model
+# --------------------------------------------------------------------------
+
+class Page:
+    def __init__(self, path: Path, fields, body, errors):
+        self.path = path
+        self.stem = path.stem
+        self.fields = fields
+        self.body = body
+        self.errors = errors
+
+    @property
+    def id(self):
+        return self.fields.get("id")
+
+    @property
+    def kind(self):
+        return self.fields.get("kind")
+
+    @property
+    def status(self):
+        return self.fields.get("status")
+
+    def body_hash(self):
+        return "sha256:" + hashlib.sha256(self.body.encode("utf-8")).hexdigest()
+
+
+def load_pages(pages_dir: Path):
+    pages = []
+    if not pages_dir.is_dir():
+        return pages
+    for p in sorted(pages_dir.glob("*.md")):
+        text = p.read_text(encoding="utf-8")
+        fields, body, errors = parse_frontmatter(text)
+        pages.append(Page(p, fields, body, errors))
+    return pages
+
+
+def effective_visibility(repo_visibility: str, page_visibility: str) -> str:
+    if repo_visibility == "public":
+        return "public"
+    if page_visibility == "public-safe":
+        return "public-safe"
+    return "private"
+
+
+# --------------------------------------------------------------------------
+# Manifest + INDEX generation
+# --------------------------------------------------------------------------
+
+def build_manifest(wiki_dir: Path, repo_root: Path):
+    cfg = parse_wiki_toml((wiki_dir / "wiki.toml").read_text(encoding="utf-8")) \
+        if (wiki_dir / "wiki.toml").exists() else {}
+    repo_name = cfg.get("repo", "")
+    repo_vis = cfg.get("visibility", "private")
+    pages = load_pages(wiki_dir / "pages")
+
+    page_entries = []
+    for pg in pages:
+        f = pg.fields
+        ver = f.get("verified", {}) or {}
+        page_entries.append({
+            "id": f.get("id", pg.stem),
+            "path": f"pages/{pg.path.name}",
+            "title": f.get("title", ""),
+            "kind": f.get("kind", ""),
+            "status": f.get("status", ""),
+            "maintainer": f.get("maintainer", ""),
+            "locked": f.get("locked", "false") == "true" if isinstance(f.get("locked"), str) else bool(f.get("locked", False)),
+            "visibility": effective_visibility(repo_vis, f.get("visibility", "repo")),
+            "hash": pg.body_hash(),
+            "verified_commit": ver.get("commit", ""),
+            "verified_date": ver.get("date", ""),
+            "links": list(f.get("links", []) or []),
+            "sources": list(f.get("sources", []) or []),
+        })
+    page_entries.sort(key=lambda e: e["id"])
+
+    manifest = {
+        "schema": "wiki-manifest/v1",
+        "repo": repo_name,
+        "visibility": "public" if repo_vis == "public" else "private",
+        "head_commit": head_short(repo_root),
+        "generated_at": head_iso(repo_root),
+        "pages": page_entries,
+    }
+    return manifest
+
+
+def dump_manifest(manifest) -> str:
+    return json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+
+
+def _body_summary(body: str) -> str:
+    for line in body.split("\n"):
+        s = line.strip()
+        if s and not s.startswith("#"):
+            return s
+    return ""
+
+
+def build_index(wiki_dir: Path):
+    cfg = parse_wiki_toml((wiki_dir / "wiki.toml").read_text(encoding="utf-8")) \
+        if (wiki_dir / "wiki.toml").exists() else {}
+    repo_name = cfg.get("repo", "repo")
+    pages = load_pages(wiki_dir / "pages")
+
+    by_kind = {k: [] for k in KIND_ORDER}
+    for pg in pages:
+        by_kind.setdefault(pg.kind, []).append(pg)
+
+    out = [f"# {repo_name} wiki index", ""]
+    for kind in KIND_ORDER:
+        group = sorted(by_kind.get(kind, []), key=lambda p: p.id or p.stem)
+        for pg in group:
+            f = pg.fields
+            title = f.get("title", pg.stem)
+            hook = _body_summary(pg.body)
+            if len(hook) > 100:
+                hook = hook[:97] + "..."
+            markers = []
+            if f.get("status") == "stale":
+                markers.append("⚠stale")
+            if (f.get("locked") == "true"):
+                markers.append("\U0001f512")
+            if f.get("status") == "draft":
+                markers.append("[draft]")
+            marker_str = (" " + " ".join(markers)) if markers else ""
+            hook_str = f" — {hook}" if hook else ""
+            out.append(f"- [{title}](pages/{pg.stem}.md){hook_str}{marker_str}")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Checks
+# --------------------------------------------------------------------------
+
+def run_checks(wiki_dir: Path, repo_root: Path):
+    findings = []
+
+    def add(code, level, path, message):
+        findings.append(Finding(code, level, path, message))
+
+    cfg_path = wiki_dir / "wiki.toml"
+    cfg = parse_wiki_toml(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    repo_vis = cfg.get("visibility", None)
+
+    # WK-L1: only INDEX.md, wiki.toml, manifest.json, pages/*.md allowed.
+    allowed_top = {"INDEX.md", "wiki.toml", "manifest.json", "pages"}
+    for entry in sorted(wiki_dir.iterdir()):
+        rel = entry.name
+        if entry.is_dir():
+            if rel != "pages":
+                add("WK-L1", "error", str(entry), f"unexpected directory under wiki/: {rel}")
+        elif rel not in allowed_top:
+            add("WK-L1", "error", str(entry), f"unexpected file under wiki/: {rel}")
+    pages_dir = wiki_dir / "pages"
+    if pages_dir.is_dir():
+        for entry in sorted(pages_dir.iterdir()):
+            if entry.is_dir() or entry.suffix != ".md":
+                add("WK-L1", "error", str(entry), f"only *.md allowed under pages/: {entry.name}")
+
+    pages = load_pages(pages_dir)
+    ids = {}
+    for pg in pages:
+        if pg.id:
+            ids.setdefault(pg.id, []).append(pg)
+
+    # WK-L2: frontmatter grammar + field validity.
+    for pg in pages:
+        for e in pg.errors:
+            add("WK-L2", "error", str(pg.path), e)
+        f = pg.fields
+        for key in sorted(f):
+            if key not in KNOWN_FIELDS:
+                add("WK-L2", "error", str(pg.path), f"unknown frontmatter field: {key}")
+        for req in REQUIRED_FIELDS:
+            if req not in f:
+                if req == "sources" and f.get("kind") == "question":
+                    continue
+                add("WK-L2", "error", str(pg.path), f"missing required field: {req}")
+        if "id" in f and not ID_RE.match(f["id"] or ""):
+            add("WK-L2", "error", str(pg.path), f"id not kebab-case [a-z0-9-]{{3,64}}: {f['id']!r}")
+        if "kind" in f and f["kind"] not in KINDS:
+            add("WK-L2", "error", str(pg.path), f"invalid kind: {f['kind']!r}")
+        if "status" in f and f["status"] not in STATUSES:
+            add("WK-L2", "error", str(pg.path), f"invalid status: {f['status']!r}")
+        if "maintainer" in f and f["maintainer"] not in MAINTAINERS:
+            add("WK-L2", "error", str(pg.path), f"invalid maintainer: {f['maintainer']!r}")
+        if "locked" in f and f["locked"] not in ("true", "false"):
+            add("WK-L2", "error", str(pg.path), f"locked must be true|false: {f['locked']!r}")
+        if "visibility" in f and f["visibility"] not in VISIBILITIES:
+            add("WK-L2", "error", str(pg.path), f"invalid visibility: {f['visibility']!r}")
+        if "sources" in f and f["kind"] != "question" and not f["sources"]:
+            add("WK-L2", "error", str(pg.path), "sources may be empty only for kind: question")
+        ver = f.get("verified")
+        if isinstance(ver, dict):
+            if "date" in ver and not DATE_RE.match(ver["date"]):
+                add("WK-L2", "error", str(pg.path), f"verified.date not ISO YYYY-MM-DD: {ver['date']!r}")
+
+        # WK-L3: body caps.
+        n_lines = len(pg.body.split("\n"))
+        n_bytes = len(pg.body.encode("utf-8"))
+        if n_lines > MAX_BODY_LINES or n_bytes > MAX_BODY_BYTES:
+            add("WK-L3", "error", str(pg.path),
+                f"body too large: {n_lines} lines / {n_bytes} bytes (max {MAX_BODY_LINES}/{MAX_BODY_BYTES})")
+
+    # WK-L4: id/filename mismatch or duplicate ids.
+    for pg in pages:
+        if pg.id and pg.id != pg.stem:
+            add("WK-L4", "error", str(pg.path), f"id {pg.id!r} != filename stem {pg.stem!r}")
+    for pid, group in sorted(ids.items()):
+        if len(group) > 1:
+            add("WK-L4", "error", str(group[0].path), f"duplicate id across pages: {pid}")
+
+    # WK-L5: broken [[links]] / links: entries; deprecated targets warn.
+    id_status = {pg.id: pg.status for pg in pages if pg.id}
+    for pg in pages:
+        targets = set(pg.fields.get("links", []) or [])
+        targets |= set(LINK_RE.findall(pg.body))
+        for t in sorted(targets):
+            if t not in id_status:
+                add("WK-L5", "error", str(pg.path), f"broken link target: {t}")
+            elif id_status[t] == "deprecated":
+                add("WK-L5", "warning", str(pg.path), f"link to deprecated page: {t}")
+
+    # WK-L6: exactly one overview page with id overview.
+    overviews = [pg for pg in pages if pg.kind == "overview"]
+    if len(overviews) == 0:
+        add("WK-L6", "error", str(wiki_dir), "no overview page (kind: overview, id: overview required)")
+    elif len(overviews) > 1:
+        add("WK-L6", "error", str(wiki_dir), f"more than one overview page: {len(overviews)}")
+    elif overviews[0].id != "overview":
+        add("WK-L6", "error", str(overviews[0].path), "overview page must have id: overview")
+
+    # WK-L7: INDEX.md consistency with pages/.
+    index_path = wiki_dir / "INDEX.md"
+    if not index_path.exists():
+        add("WK-L7", "error", str(wiki_dir), "INDEX.md missing")
+    else:
+        indexed = set(INDEX_LINK_RE.findall(index_path.read_text(encoding="utf-8")))
+        page_ids = {pg.stem for pg in pages}
+        for missing in sorted(page_ids - indexed):
+            add("WK-L7", "error", str(index_path), f"page not listed in INDEX.md: {missing}")
+        for extra in sorted(indexed - page_ids):
+            add("WK-L7", "error", str(index_path), f"INDEX.md lists nonexistent page: {extra}")
+
+    # WK-L8: page-count cap.
+    if len(pages) > MAX_PAGES:
+        add("WK-L8", "error", str(wiki_dir), f"too many pages: {len(pages)} (max {MAX_PAGES})")
+    elif len(pages) >= SOFT_PAGE_WARN:
+        add("WK-L8", "warning", str(wiki_dir), f"approaching page cap: {len(pages)} (soft warn at {SOFT_PAGE_WARN})")
+
+    # WK-L9: visibility placement (config validity + open-repo publishability).
+    if repo_vis not in ("public", "private"):
+        add("WK-L9", "error", str(cfg_path), f"wiki.toml visibility must be public|private: {repo_vis!r}")
+
+    # WK-L10: manifest.json out of date (content compare, ignoring commit stamp).
+    manifest_path = wiki_dir / "manifest.json"
+    regenerated = build_manifest(wiki_dir, repo_root)
+    if not manifest_path.exists():
+        add("WK-L10", "error", str(wiki_dir), "manifest.json missing (run --manifest)")
+    else:
+        try:
+            committed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            committed = None
+            add("WK-L10", "error", str(manifest_path), f"manifest.json is not valid JSON: {e}")
+        if committed is not None:
+            if _manifest_content(committed) != _manifest_content(regenerated):
+                add("WK-L10", "error", str(manifest_path),
+                    "manifest.json out of date (committed != regenerated; run --manifest)")
+
+    # WK-W11 / WK-W12: staleness.
+    hdate = head_date(repo_root)
+    for pg in pages:
+        ver = pg.fields.get("verified") or {}
+        commit = ver.get("commit", "") if isinstance(ver, dict) else ""
+        date_str = ver.get("date", "") if isinstance(ver, dict) else ""
+        # WK-W11
+        if not commit_resolves(repo_root, commit):
+            add("WK-W11", "warning", str(pg.path),
+                f"candidate-stale: verified.commit {commit!r} unresolvable")
+        else:
+            changed = diff_names(repo_root, commit)
+            if changed:
+                touched = _sources_touched(pg.fields.get("sources", []) or [], changed)
+                if touched:
+                    add("WK-W11", "warning", str(pg.path),
+                        f"candidate-stale: sources touched since {commit}: {', '.join(sorted(touched))}")
+        # WK-W12
+        if DATE_RE.match(date_str or "") and hdate is not None:
+            try:
+                vd = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if (hdate - vd).days > STALE_DAYS:
+                    add("WK-W12", "warning", str(pg.path),
+                        f"verified.date {date_str} older than {STALE_DAYS} days")
+            except ValueError:
+                pass
+
+    findings.sort(key=lambda x: x.sort_key())
+    return findings
+
+
+def _manifest_content(m):
+    """The commit-independent portion used for WK-L10 equality.
+
+    head_commit and generated_at are stamps derived from HEAD; a committed
+    manifest can never embed its own future commit, so they are excluded from
+    the freshness comparison (like a lockfile that does not embed its own SHA).
+    Everything describing page content is compared."""
+    m = dict(m)
+    m.pop("head_commit", None)
+    m.pop("generated_at", None)
+    return json.dumps(m, sort_keys=True)
+
+
+def _sources_touched(sources, changed):
+    touched = set()
+    for src in sources:
+        if src.startswith("url:"):
+            continue
+        pat = src.split("#", 1)[0]
+        for name in changed:
+            if name == pat or fnmatch.fnmatch(name, pat) or name.startswith(pat.rstrip("*")):
+                touched.add(pat)
+                break
+    return touched
+
+
+def candidate_stale_ids(findings):
+    ids = set()
+    for f in findings:
+        if f.code in ("WK-W11", "WK-W12"):
+            stem = Path(f.path).stem
+            ids.add(stem)
+    return sorted(ids)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+USAGE = (
+    "usage: wiki-lint [--manifest|--index|--stale|--json|--version] [path]\n"
+    "  path defaults to ./wiki (the directory containing INDEX.md, wiki.toml, pages/)\n"
+)
+
+
+def resolve_wiki_dir(arg):
+    p = Path(arg).resolve()
+    if (p / "wiki.toml").exists() or (p / "pages").exists():
+        return p
+    if (p / "wiki").exists():
+        return (p / "wiki").resolve()
+    return p
+
+
+def main(argv):
+    mode = "check"
+    path_arg = None
+    for a in argv:
+        if a == "--version":
+            print(SPEC_VERSION)
+            return 0
+        if a in ("--manifest", "--index", "--stale", "--json"):
+            mode = a.lstrip("-")
+        elif a in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            return 0
+        elif a.startswith("-"):
+            sys.stderr.write(f"unknown option: {a}\n{USAGE}")
+            return 2
+        else:
+            path_arg = a
+
+    wiki_dir = resolve_wiki_dir(path_arg or "wiki")
+    if not wiki_dir.is_dir():
+        sys.stderr.write(f"error: not a directory: {wiki_dir}\n")
+        return 2
+    repo_root = repo_root_of(wiki_dir)
+
+    try:
+        if mode == "manifest":
+            sys.stdout.write(dump_manifest(build_manifest(wiki_dir, repo_root)))
+            return 0
+        if mode == "index":
+            sys.stdout.write(build_index(wiki_dir))
+            return 0
+
+        findings = run_checks(wiki_dir, repo_root)
+
+        if mode == "stale":
+            for sid in candidate_stale_ids(findings):
+                print(sid)
+            return 0
+        if mode == "json":
+            out = {
+                "schema": "wiki-lint-findings/v1",
+                "spec_version": SPEC_VERSION,
+                "wiki": str(wiki_dir),
+                "findings": [f.as_dict() for f in findings],
+            }
+            sys.stdout.write(json.dumps(out, sort_keys=True, indent=2) + "\n")
+            return 1 if any(f.level == "error" for f in findings) else 0
+
+        # human-readable
+        errors = [f for f in findings if f.level == "error"]
+        warnings = [f for f in findings if f.level == "warning"]
+        for f in findings:
+            tag = "ERROR" if f.level == "error" else "warn "
+            loc = f.path or str(wiki_dir)
+            print(f"{tag} {f.code} {loc}: {f.message}")
+        print(f"\n{len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1 if errors else 0
+    except OSError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
