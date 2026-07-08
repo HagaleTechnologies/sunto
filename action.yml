@@ -1,0 +1,13 @@
+name: wiki-lint
+description: Lint a wiki/ directory against wiki-manifest/v1 conventions
+inputs:
+  path:
+    description: Directory to lint
+    required: false
+    default: wiki/
+runs:
+  using: composite
+  steps:
+    - name: Lint wiki
+      shell: bash
+      run: python3 "${GITHUB_ACTION_PATH}/bin/wiki-lint" "${{ inputs.path }}"
