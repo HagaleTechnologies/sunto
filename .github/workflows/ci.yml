@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: wiki-lint fixture check (expect exit 1, WK-L10)
+        run: |
+          set +e
+          python3 bin/wiki-lint fixtures/wiki/
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 (WK-L10) from the deliberately-broken fixture, got $code"
+            exit 1
+          fi
+      - name: wiki-lint manifest output is valid JSON
+        run: python3 bin/wiki-lint --manifest fixtures/wiki/ | python3 -c 'import sys,json; json.load(sys.stdin)'
+      - name: real-history staleness fixture (WK-W11)
+        run: bash fixtures/setup.sh
