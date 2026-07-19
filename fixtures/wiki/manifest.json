@@ -1,0 +1,135 @@
+{
+  "generated_at": "2026-07-07T17:27:02Z",
+  "head_commit": "deadbee",
+  "pages": [
+    {
+      "hash": "sha256:d63e7f0c657bd40e416da0477b9c6721373a7763947149f496ff86df8ab9ff70",
+      "id": "config-gotcha",
+      "kind": "gotcha",
+      "links": [],
+      "locked": true,
+      "maintainer": "agent",
+      "path": "pages/config-gotcha.md",
+      "sources": [
+        "src/config.rs"
+      ],
+      "status": "current",
+      "title": "Why does SKIMMER_THREADS=0 silently disable detection?",
+      "verified_commit": "ccccccc",
+      "verified_date": "2026-07-03",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:5aa1bc980ea7b20d8a7e41c51528f1eac1f42fe7f5737ee142302821e93fbf47",
+      "id": "deploy-runbook",
+      "kind": "runbook",
+      "links": [],
+      "locked": false,
+      "maintainer": "human",
+      "path": "pages/deploy-runbook.md",
+      "sources": [
+        "deploy/skimmer.service",
+        "scripts/deploy.sh"
+      ],
+      "status": "current",
+      "title": "How do I deploy skimmer to the receiver host?",
+      "verified_commit": "eeeeeee",
+      "verified_date": "2026-07-02",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:1014b51fb17cf475ba66bb7f81e289de970fe11eaca610324acd851bba820dc1",
+      "id": "dsp-pipeline",
+      "kind": "subsystem",
+      "links": [
+        "hot-loop"
+      ],
+      "locked": false,
+      "maintainer": "mixed",
+      "path": "pages/dsp-pipeline.md",
+      "sources": [
+        "crates/skimmer-dsp/**"
+      ],
+      "status": "current",
+      "title": "How is the DSP pipeline staged and why?",
+      "verified_commit": "bbbbbbb",
+      "verified_date": "2026-07-04",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "id": "hot-loop",
+      "kind": "subsystem",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/hot-loop.md",
+      "sources": [
+        "src/hot_loop.rs",
+        "url:https://example.com/ringbuffer-spec"
+      ],
+      "status": "current",
+      "title": "How does the sample hot loop stay allocation-free?",
+      "verified_commit": "aaaaaaa",
+      "verified_date": "2026-07-05",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:367896b585696799ad82785c24856e6e2c867320bd7ed19eddcbcbc71dd528fa",
+      "id": "open-detector-question",
+      "kind": "question",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/open-detector-question.md",
+      "sources": [],
+      "status": "draft",
+      "title": "Can the detector threshold adapt without a full recalibration pass?",
+      "verified_commit": "fffffff",
+      "verified_date": "2026-07-01",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:790a5a914384730b9e2b1ff096c6a0fb270190f62e6132dd3a26ef19289d09a0",
+      "id": "overview",
+      "kind": "overview",
+      "links": [
+        "dsp-pipeline",
+        "hot-loop"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/overview.md",
+      "sources": [
+        "README.md",
+        "crates/**/*.rs"
+      ],
+      "status": "current",
+      "title": "skimmer \u2014 what is this and where do things live?",
+      "verified_commit": "0b5029d",
+      "verified_date": "2026-07-05",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:f38f5b6a710ceda1fd21ccfcbb0bd1c2b2386e8411c4d78694490b2237ec14a7",
+      "id": "spot-format-decision",
+      "kind": "decision-digest",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/spot-format-decision.md",
+      "sources": [
+        "docs/adr/0004-spot-format.md",
+        "url:https://ndjson.org/"
+      ],
+      "status": "current",
+      "title": "Why is the spot stream newline-delimited JSON, not protobuf?",
+      "verified_commit": "ddddddd",
+      "verified_date": "2026-01-01",
+      "visibility": "public"
+    }
+  ],
+  "repo": "skimmer",
+  "schema": "wiki-manifest/v1",
+  "visibility": "public"
+}
