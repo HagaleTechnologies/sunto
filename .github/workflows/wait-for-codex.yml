@@ -428,7 +428,7 @@ jobs:
           # trade-off is deliberately asymmetric: a genuine reopen-with-new-
           # commits case now needs a human to notice and re-trigger, rather
           # than risk silently clearing a real unaddressed finding.
-          IS_REMEDIATION: ${{ github.event.action == 'synchronize' }}
+          IS_REMEDIATION: ${{ github.event.action == 'synchronize' && github.run_attempt == 1 }}
         run: |
           set -o pipefail
           # Only count signals created at/after this run started, and reviews
@@ -485,9 +485,20 @@ jobs:
                   }
                 }
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" 2>/tmp/poll-err.log); then
-              echo "::warning::Transient error polling for a Codex signal — retrying in 20s. $(cat /tmp/poll-err.log 2>/dev/null)"
-              sleep 20
-              continue
+              # Classify by content here too, not just on the downstream
+              # jq-failure branch: a gh call that fails outright (bad/revoked
+              # token, invalid query) is just as permanent as one that
+              # returns malformed JSON, so blindly retrying every gh failure
+              # for the full 70-minute budget defeats the whole point of
+              # having a non-transient fail-fast path (Codex P2, flagged
+              # reviewing this file on sunto's sync PR).
+              if grep -qiE "could not resolve to a node|HTTP 5[0-9]{2}|context deadline exceeded|connection reset|timeout|\bEOF\b" /tmp/poll-err.log 2>/dev/null; then
+                echo "::warning::Transient error polling for a Codex signal — retrying in 20s. $(cat /tmp/poll-err.log 2>/dev/null)"
+                sleep 20
+                continue
+              fi
+              echo "::error::Non-transient error polling for a Codex signal — failing fast: $(cat /tmp/poll-err.log 2>/dev/null)"
+              exit 1
             fi
             # gh's own failure is now checked directly above (if !), not
             # swallowed by || true: a failed call previously fell through as
@@ -519,7 +530,7 @@ jobs:
               exit 0
             fi
             if ! poll=$(echo "$gh_poll_raw" | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(you exceeded your current quota|quota exceeded|rate limit reached|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                def is_error_shaped: test("((quota|rate.?limit).{0,30}exceeded|exceeded.{0,30}(quota|rate.?limit)|rate limit reached|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
                 # plain issue comment (not a formal review, not a reaction) whose
                 # body embeds "**Reviewed commit:** `<10-hex-char prefix>`" — a
