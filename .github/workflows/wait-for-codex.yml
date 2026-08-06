@@ -69,7 +69,16 @@ concurrency:
   # flagged reviewing this file on banco's sync PR, round 2 — a direct
   # regression finding on round 1's own fix).
   group: wait-for-codex-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
-  cancel-in-progress: true
+  # Restricted to run_attempt == 1 (a genuinely fresh trigger): a manual
+  # rerun of an OLD attempt (e.g. after a transient Codex error) replays the
+  # ORIGINAL event and shares this same group — without this restriction it
+  # could cancel a run that's actively gating a NEWER head before that run's
+  # own head-check step gets a chance to no-op the stale rerun instead,
+  # leaving the current head's required check cancelled until another push
+  # or manual rerun (Codex P2, flagged reviewing this file on
+  # widdershins#114). A fresh run (attempt 1) still cancels a stale
+  # in-progress one normally — only reruns are held back from cancelling.
+  cancel-in-progress: ${{ github.run_attempt == 1 }}
 
 jobs:
   wait-for-codex:
@@ -362,6 +371,17 @@ jobs:
           # case; run_attempt extended proactively to close the identical
           # gap there before it needed its own separate finding).
           IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
+          # Deliberately NARROWER than IS_SYNC: run_attempt>1 alone means a
+          # maintainer clicked "re-run" on the SAME head with no new commit
+          # — the baseline snapshot IS the original unresolved findings
+          # themselves, so a clean re-review with zero NEW findings does not
+          # mean those findings were fixed, just that Codex didn't find
+          # anything ADDITIONAL. Auto-resolving on that basis would silently
+          # clear real, still-open findings with zero remediation ever
+          # happening (Codex P1, flagged reviewing this file on
+          # widdershins#114). Only a genuine new commit (synchronize/
+          # reopened) is safe to treat as a remediation round.
+          IS_REMEDIATION: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' }}
         run: |
           set -o pipefail
           # Only count signals created at/after this run started, and reviews
@@ -579,7 +599,7 @@ jobs:
             exit 1
           fi
 
-          if [ "$IS_SYNC" != "true" ]; then
+          if [ "$IS_REMEDIATION" != "true" ]; then
             # This branch previously exited 0 the moment ANY Codex signal was
             # seen, without checking whether that signal actually left
             # unresolved concerns open — so Codex's own initial automatic
@@ -785,7 +805,7 @@ jobs:
             # own just-posted reply is authored "github-actions", which the
             # purity test already treats as ignorable, so it doesn't trip
             # live_pure on its own.
-            live2=$(gh api graphql -f query='
+            if ! live2=$(gh api graphql -f query='
               query($id: ID!) {
                 node(id: $id) {
                   ... on PullRequestReviewThread {
@@ -793,7 +813,16 @@ jobs:
                     comments(first: 50) { nodes { author { login } createdAt } }
                   }
                 }
-              }' -f id="$thread_id")
+              }' -f id="$thread_id" 2>/tmp/live2-check-err.log); then
+              # Guarded like the first live recheck above: an unguarded
+              # assignment here would let one transient GraphQL/auth/
+              # rate-limit failure on THIS SECOND query abort the whole step
+              # before any remaining thread gets processed, even though the
+              # reply just above already landed successfully (Codex P2,
+              # flagged reviewing this file on sunto's sync PR).
+              echo "::warning::Could not re-check thread $thread_id's live state before resolving — leaving the reply in place, unresolved: $(cat /tmp/live2-check-err.log)"
+              continue
+            fi
             live2_resolved=$(echo "$live2" | jq -r '.data.node.isResolved')
             live2_pure=$(echo "$live2" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
             # Same freshness test as the first recheck, re-applied here: our
