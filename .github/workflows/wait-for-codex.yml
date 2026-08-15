@@ -1,16 +1,20 @@
 name: Wait for Codex
 
-# INTERIM VARIANT — pull_request, not pull_request_target, deliberately.
-# This repo has no wait-for-codex.yml on main yet, and pull_request_target
-# always reads its definition from the BASE branch — switching to it on a
-# branch that's ADDING the file for the first time goes dark (neither
-# trigger type fires: pull_request no longer matches this file's own `on:`,
-# and pull_request_target has nothing on base to match either). Land THIS
-# pull_request-triggered version first so main has a working baseline, then
-# a fast follow-up PR switches to pull_request_target for the real security
-# reason documented in that PR (a same-repo PR modifying the merged file
-# could otherwise exfiltrate CODEX_REVIEW_PAT or self-resolve its own
-# review threads before human review — see HagaleTechnologies/harbor#59/#60).
+# TRANSITIONAL — pull_request_target added alongside pull_request (phase
+# 1/2 of a two-step rollout), not swapped outright. A same-repo PR that
+# edits this workflow file could otherwise, under plain pull_request, run
+# its own modified copy with CODEX_REVIEW_PAT still in scope — able to
+# exfiltrate the PAT or self-resolve its own Codex review threads before a
+# human ever looks (see HagaleTechnologies/widdershins' history of this
+# fix for the full writeup). pull_request_target always reads its
+# definition from the BASE branch, closing that hole, but a single-step
+# swap can't validate itself against the "Wait for Codex Review" required
+# check (neither trigger type fires on the swap PR's own branch — pull_request
+# no longer matches once the PR's own copy drops it, and pull_request_target
+# has nothing on base to match until this merges). Landing pull_request_target
+# ALONGSIDE the existing pull_request here keeps this PR's own check running
+# normally; a fast follow-up PR drops pull_request once main carries this
+# baseline.
 on:
   # `reopened` dropped: Codex's own docs describe automatic review as firing
   # when a PR is newly opened for review, with re-requests done explicitly
@@ -18,6 +22,8 @@ on:
   # 70 minutes of passive polling for a signal that was never coming (Codex
   # P2, flagged reviewing this file).
   pull_request:
+    types: [opened, ready_for_review, synchronize]
+  pull_request_target:
     types: [opened, ready_for_review, synchronize]
 
 permissions:
@@ -30,7 +36,7 @@ permissions:
 # no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
 # right before the mutation (Codex P2, this file's own auto-merge rollout).
 concurrency:
-  group: wait-for-codex-${{ github.event.pull_request.number }}
+  group: wait-for-codex-${{ github.event.pull_request.number }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
