@@ -36,7 +36,7 @@ permissions:
 # no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
 # right before the mutation (Codex P2, this file's own auto-merge rollout).
 concurrency:
-  group: wait-for-codex-${{ github.event.pull_request.number }}
+  group: wait-for-codex-${{ github.event.pull_request.number }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
