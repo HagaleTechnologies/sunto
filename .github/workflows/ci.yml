@@ -88,9 +88,11 @@ jobs:
             else
               echo "bootstrap_status=fetch-failed" >> "$GITHUB_OUTPUT"
               echo "::error::Could not determine whether base branch's wait-for-codex.yml has the label mechanism (non-404 failure fetching $BASE_SHA, failing closed): $err"
+              rm -f "$err_file"
               exit 1
             fi
           fi
+          rm -f "$err_file"
 
       - name: Pass through -- not a synchronize event, or bootstrap not yet live on the base branch
         if: github.event.action != 'synchronize' || steps.bootstrap-check.outputs.bootstrap_status == 'absent'
@@ -130,14 +132,25 @@ jobs:
   test:
     name: test
     needs: codex-clean
-    # codex-clean can legitimately report `skipped` (a draft PR,
-    # dependabot[bot] PR, or a push:main event -- see codex-clean's own
-    # eligibility `if:` above), which is different from "ran and found the
-    # round not clean yet" (that produces `failure`). Both `success` and
-    # `skipped` mean "proceed."
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # always() + an explicit guard step (below), rather than a job-level
+    # `if: needs.codex-clean.result == 'success' || ... == 'skipped'` --
+    # the latter would make GitHub report a genuine codex-clean FAILURE
+    # (poll timeout, non-404 bootstrap fetch error) as a job-level
+    # `skipped` check-run conclusion, which .mergify.yml's queue
+    # conditions (`or: [check-success = test, check-skipped = test]`)
+    # cannot distinguish from a legitimate skip (draft/dependabot/
+    # push:main) -- letting a real gate failure silently auto-queue and
+    # merge with tests never run.
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing test explicitly so Mergify's check-skipped tolerance in .mergify.yml can't mistake this for a legitimate skip and auto-merge past a real gate failure."
+            exit 1
+          fi
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
