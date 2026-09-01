@@ -16,12 +16,15 @@
 # The check-skipped OR-clause (on `Wait for Codex Review`) is needed
 # because wait-for-codex.yml deliberately skips for dependabot[bot] pushes
 # and draft PRs -- without it, Dependabot PRs would never auto-queue.
-# `test` has no such skip (it always runs for every PR event) and stays a
-# plain condition -- but see the note below about codex-clean's own
-# `test`-level effect: codex-clean gates `test` itself (Task 3), and
-# codex-clean's OWN skip (same dependabot/draft exclusion) makes `test`
-# report skipped too on those pushes -- so `test` also needs the OR-clause,
-# not just Wait for Codex Review.
+#
+# `test` has no such skip: ci.yml's `test` job runs unconditionally
+# (`if: !cancelled()`) and its own guard step explicitly fails the job
+# when codex-clean didn't succeed or skip cleanly, rather than letting the
+# job itself go `skipped`. That means `test` can only ever report a real
+# check-run conclusion of `success` or `failure` for an actual PR event,
+# so a plain `check-success = test` condition is correct and sufficient --
+# no OR/skipped tolerance needed, and adding one back would let a genuine
+# codex-clean gate failure masquerade as a legitimate skip.
 #
 # Trusted-author gate (`author = thagale` OR `author = dependabot[bot]`):
 # this repo is public, its ruleset has `required_approving_review_count: 0`,
@@ -40,8 +43,15 @@
 # loophole in it: dependabot-auto-merge.yml's own classify step already
 # vets every Dependabot PR before it can reach this rule at all --
 # breaking/major bumps get labeled "needs-review" and are excluded outright
-# by the `-label = needs-review` condition below, so only already-vetted
-# minor/patch bumps ever reach this author check.
+# by the `-label = needs-review` condition. That alone is fail-open,
+# though: if the classify workflow ever breaks (API failure, the unpinned
+# fetch-metadata action changing behavior, the label itself getting
+# renamed or deleted), `-label = needs-review` is vacuously satisfied and
+# a major bump could auto-merge with zero human review. `check-success =
+# auto-merge` (dependabot-auto-merge.yml's job id, and therefore its
+# check-run name) closes that: the classify step has to have actually run
+# and succeeded, so a broken classify workflow blocks admission to the
+# queue instead of silently admitting.
 queue_rules:
   - name: default
     merge_method: squash
@@ -57,11 +67,12 @@ pull_request_rules:
       - -label = needs-review
       - or:
           - author = thagale
-          - author = dependabot[bot]
+          - and:
+              - author = dependabot[bot]
+              - -label = needs-review
+              - check-success = auto-merge
       - "#review-threads-unresolved = 0"
-      - or:
-          - check-success = test
-          - check-skipped = test
+      - check-success = test
       - or:
           - check-success = Wait for Codex Review
           - check-skipped = Wait for Codex Review

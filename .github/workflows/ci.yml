@@ -132,16 +132,20 @@ jobs:
   test:
     name: test
     needs: codex-clean
-    # always() + an explicit guard step (below), rather than a job-level
+    # !cancelled() + an explicit guard step (below), rather than a job-level
     # `if: needs.codex-clean.result == 'success' || ... == 'skipped'` --
     # the latter would make GitHub report a genuine codex-clean FAILURE
     # (poll timeout, non-404 bootstrap fetch error) as a job-level
-    # `skipped` check-run conclusion, which .mergify.yml's queue
-    # conditions (`or: [check-success = test, check-skipped = test]`)
-    # cannot distinguish from a legitimate skip (draft/dependabot/
-    # push:main) -- letting a real gate failure silently auto-queue and
-    # merge with tests never run.
-    if: always()
+    # `skipped` check-run conclusion, which .mergify.yml's queue condition
+    # (`check-success = test`) cannot distinguish from a legitimate skip --
+    # letting a real gate failure silently auto-queue and merge with tests
+    # never run. `!cancelled()` rather than `always()`: the latter also
+    # evaluates true when the workflow run itself was cancelled (e.g. by
+    # this workflow's `concurrency: cancel-in-progress: true` superseding
+    # an earlier run on the same head SHA after a rapid re-push), which
+    # can produce a spurious `test = failure` on an already-superseded
+    # run and leave a permanently red required check on the current head.
+    if: '!cancelled()'
     runs-on: ubuntu-latest
     steps:
       - name: Fail explicitly (not silently skip) if codex-clean did not pass
