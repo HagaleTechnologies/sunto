@@ -65,3 +65,4 @@ This kit implements **wiki-kit v1** — the `wiki-manifest/v1` and
 normative specification.
 
 Licensed MIT OR Apache-2.0.
+
