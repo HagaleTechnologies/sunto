@@ -52,6 +52,23 @@
 # check-run name) closes that: the classify step has to have actually run
 # and succeeded, so a broken classify workflow blocks admission to the
 # queue instead of silently admitting.
+#
+# max_parallel_checks: 1 (required -- confirmed live: `@Mergifyio queue`
+# rejected a real PR outright with "Configuration not compatible with
+# `required_status_checks` ruleset rule"): this repo's ruleset has
+# `strict_required_status_checks_policy: true` ("require branches to be up
+# to date before merging"), which Mergify refuses to pair with its default
+# draft-PR validation (a synthetic PR re-running checks against a
+# merge-commit preview) -- that mode is fundamentally incompatible with
+# "checks must have run against the exact up-to-date branch tip."
+# max_parallel_checks: 1, combined with batch_size: 1 (already set below)
+# and no separate merge_conditions (so queue admission and the final merge
+# check are the same condition set), is what makes Mergify reuse the PR's
+# own already-green checks in place instead of creating a draft PR -- see
+# docs.mergify.com/merge-queue/rules, "in-place checks."
+merge_queue:
+  max_parallel_checks: 1
+
 queue_rules:
   - name: default
     merge_method: squash
