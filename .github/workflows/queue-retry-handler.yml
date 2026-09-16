@@ -361,7 +361,13 @@ jobs:
         # already (env: carries every dynamic value), but raw size alone still crossed the line
         # this round -- extracted to a checked-out script so the run: block itself (what's
         # measured) is a single invocation line regardless of how large the script grows later.
-        run: .github/scripts/queue-retry-once.sh
+        #
+        # `bash`, not a direct execution: the file is committed as mode 100644 (not
+        # executable), so `.github/scripts/queue-retry-once.sh` alone fails with
+        # "Permission denied" before ever running -- confirmed live, this silently skipped
+        # every retry attempt. Invoking through `bash` explicitly sidesteps the file's own
+        # executable bit entirely.
+        run: bash .github/scripts/queue-retry-once.sh
 
       - name: Second failure on this exact revision -- hand off, do not retry again
         id: handoff
