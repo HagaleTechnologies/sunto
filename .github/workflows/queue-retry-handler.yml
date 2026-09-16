@@ -36,13 +36,22 @@ on:
     # rollout's own review). All three need to already be listening for merge_group, or a
     # merge-group failure on any of them gets neither an automatic retry nor a needs-review
     # handoff, leaving the PR silently open.
-    workflows: ['CI', 'Wait for Codex Review']
+    # 'Wait for Codex', not 'Wait for Codex Review' -- workflow_run.workflows matches the
+    # upstream workflow's own top-level `name:` field (.github/workflows/wait-for-codex.yml
+    # declares `name: Wait for Codex`); 'Wait for Codex Review' is only that workflow's
+    # wrapper job/check name, which this filter can't see.
+    workflows: ['CI', 'Wait for Codex']
     types: [completed]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
+  # queue-retry-once.sh's trusted-author reauthorization reads a commit's check-runs (the
+  # Dependabot 'auto-merge' check specifically) via github.token (READ_TOKEN) -- that
+  # endpoint needs this scope; without it the request silently reads as absent, the retry
+  # never rearms, and the attempt still gets marked handled, leaving the PR silently open.
+  checks: read
 
 # Workflow-level, not inline per call site: GitHub hard-caps a `run:` block containing ANY
 # `${{ }}` interpolation at ~21,000 characters, evaluated as a single expression -- a
@@ -554,6 +563,17 @@ jobs:
               fi
             fi
 
+            # Recorded BEFORE the create/POST below, same reasoning as the normal handoff
+            # path above: if needs-review was already attached by another producer (a
+            # manual attach, or auto-merge-trigger.yml's own `labeled` handling), this
+            # fallback isn't the true provenance owner of the existing pause and must not
+            # post a marker claiming it is -- the staleness detector in auto-merge-once.sh
+            # trusts a bot marker posted after the label's latest `labeled` event, so an
+            # unconditional marker here would let a NEXT push treat someone else's manual
+            # pause as this handler's own and clear it.
+            labels_before_fallback=$(gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name')
+            already_present_fallback=$(grep -qxF "needs-review" <<< "$labels_before_fallback" && echo true || echo false)
+
             gh label create needs-review --color d73a4a \
               --description "Needs a human decision -- an automated handler could not safely proceed" \
               --repo "$REPO" >/dev/null 2>&1 || true
@@ -564,20 +584,24 @@ jobs:
               exit 1
             fi
 
+            if [ "$already_present_fallback" = "true" ]; then
+              MARKER=""
+            else
+              MARKER="
+              <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->"
+            fi
+
             if { [ "$still_armed" != "true" ] && [ "$still_armed" != "false" ]; } || { [ "$in_queue" != "true" ] && [ "$in_queue" != "false" ]; }; then
               echo "::error::Could not confirm PR #$PR's armed/queued state -- treating as unsafe (fail closed)." >&2
-              gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Attempted to disarm auto-merge and dequeue, but could NOT confirm the resulting state at all (a verification query itself failed) -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify (and check whether it's still in the merge queue), or close/reopen the PR.
-              <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" || true
+              gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Attempted to disarm auto-merge and dequeue, but could NOT confirm the resulting state at all (a verification query itself failed) -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify (and check whether it's still in the merge queue), or close/reopen the PR.${MARKER}" || true
               exit 1
             fi
             if [ "$still_armed" = "true" ] || [ "$in_queue" = "true" ]; then
               echo "::error::Auto-merge is STILL ARMED and/or PR #$PR is still in the merge queue (commit $HEAD_SHA12; armed: $still_armed, queued: $in_queue) despite the disable-auto/dequeue calls."
-              gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Attempted to disarm auto-merge and dequeue, but could NOT confirm it's actually clear -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify (and check whether it's still in the merge queue), or close/reopen the PR.
-              <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" || true
+              gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Attempted to disarm auto-merge and dequeue, but could NOT confirm it's actually clear -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify (and check whether it's still in the merge queue), or close/reopen the PR.${MARKER}" || true
               exit 1
             else
-              gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Disarmed auto-merge rather than risk it -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved.
-              <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" || true
+              gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed for commit \`$HEAD_SHA12\`, and the attempt-tracking label used to prevent a duplicate/confused handling of this same failure could not be recorded. Disarmed auto-merge rather than risk it -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved.${MARKER}" || true
             fi
           fi
 

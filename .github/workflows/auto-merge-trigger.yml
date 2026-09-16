@@ -149,13 +149,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          # Read directly from the event payload, not a `GET /actions/runs/{id}` call: that
+          # endpoint needs `actions: read`, a scope this workflow doesn't otherwise need and
+          # doesn't grant -- the call would 403, HEAD_SHA would never be set, and this whole
+          # retrigger path would silently never fire for any Dependabot PR. The event payload
+          # already carries the completed run's own head_sha directly.
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           # github.event.workflow_run.pull_requests is populated by GitHub for a same-repo PR
-          # (Dependabot PRs always are -- never a fork), but fetch fresh via the run's own head
-          # SHA regardless, rather than trusting the webhook-delivery-time array, since a
-          # retry/rerun of the classify workflow could be evaluating an already-superseded head.
-          HEAD_SHA=$(gh api "repos/${REPO}/actions/runs/${WORKFLOW_RUN_ID}" --jq '.head_sha')
+          # (Dependabot PRs always are -- never a fork), but resolve the PR from the run's own
+          # head SHA via the commits/pulls lookup regardless, rather than trusting that
+          # webhook-delivery-time array, since a retry/rerun of the classify workflow could be
+          # evaluating an already-superseded head.
           PR=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '[.[] | select(.state == "open")] | first | .number // empty')
           if [ -z "$PR" ]; then
             echo "::notice::No open PR found for commit $HEAD_SHA (already merged/closed, or not a PR head) -- nothing to retrigger."
