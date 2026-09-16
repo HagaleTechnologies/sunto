@@ -34,6 +34,12 @@ on:
   # P2, flagged reviewing this file).
   pull_request_target:
     types: [opened, ready_for_review, synchronize]
+  # Native merge-queue cutover: the required "Wait for Codex Review" check must be able to
+  # resolve for a merge-group synthetic commit too, or the merge_queue ruleset rule can never
+  # admit anything. Handled by the native wait-for-codex job below (pass-through, not a
+  # re-review -- see its own header comment).
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -50,12 +56,27 @@ permissions:
 # no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
 # right before the mutation (Codex P2, this file's own auto-merge rollout).
 concurrency:
-  group: wait-for-codex-${{ github.event.pull_request.number }}-${{ github.event_name }}
+  # Native merge-queue cutover: github.event.pull_request.number is empty for a merge_group
+  # event, and this group key is workflow-level (applies to every job here) -- without the
+  # merge_group.head_sha fallback, every merge-group run of this workflow would collapse into
+  # the SAME group and cancel each other under cancel-in-progress: true, regardless of which
+  # PR's merge attempt each one actually belongs to.
+  group: wait-for-codex-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
-  wait-for-codex:
-    name: Wait for Codex Review
+  wait-for-codex-call:
+    # Native merge-queue cutover: scoped to pull_request_target explicitly, not just left to
+    # the pre-existing draft/dependabot conditions below -- those reference
+    # github.event.pull_request, which is undefined (not an error, just always-false) on a
+    # merge_group event, so this job already skipped for merge_group before this line was
+    # added; making it explicit here means that's a design decision, not an accident. The
+    # native "Wait for Codex Review" check-run name lives on the separate job below, which
+    # handles both event types.
+    if: |
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.draft == false &&
+      github.actor != 'dependabot[bot]'
     # dependabot[bot] excluded outright, not just from the re-review-request
     # step: GitHub withholds Actions secrets (and downgrades GITHUB_TOKEN) for
     # Dependabot-triggered events, so CODEX_REVIEW_PAT is empty on every
@@ -65,7 +86,6 @@ jobs:
     # this repo's own dependabot-auto-merge workflow is supposed to handle
     # (Codex P2, flagged reviewing this file). A skipped required check
     # satisfies branch protection the same as the existing draft-PR no-op.
-    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -666,3 +686,39 @@ jobs:
             fi
             echo "Auto-resolved thread $thread_id"
           done
+
+  # Native (non-uses:) job carrying the literal required-check name, and absorbing this
+  # repo's merge_group pass-through. GitHub's own merge queue re-validates a PR's already-
+  # reviewed head as a synthetic integration commit -- there's no new PR to comment on or
+  # review threads to resolve at that point, so this job passes the merge-group SHA through
+  # rather than attempting to re-run wait-for-codex-call's pull_request_target-only logic
+  # against it.
+  wait-for-codex:
+    name: Wait for Codex Review
+    needs: [wait-for-codex-call]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report result
+        run: |
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            echo "merge_group event: pass-through (the merge-group SHA already passed a real Codex review during its PR phase)."
+            exit 0
+          fi
+          # A skip here means "draft PR or dependabot[bot] -- not applicable for this
+          # revision," the same case this repo's own pre-migration logic already handled as
+          # a legitimate no-op (see wait-for-codex-call's own header comment: "a skipped
+          # required check satisfies branch protection the same as the existing draft-PR
+          # no-op"). This tolerance must hold here too, or every draft/dependabot PR fails
+          # this required check outright.
+          if [ "${{ needs.wait-for-codex-call.result }}" = "skipped" ]; then
+            echo "wait-for-codex-call skipped (draft PR or dependabot[bot] -- not applicable for this revision)."
+            exit 0
+          fi
+          if [ "${{ needs.wait-for-codex-call.result }}" != "success" ]; then
+            echo "::error::wait-for-codex-call did not succeed (result: ${{ needs.wait-for-codex-call.result }})"
+            exit 1
+          fi
+          echo "wait-for-codex-call succeeded."

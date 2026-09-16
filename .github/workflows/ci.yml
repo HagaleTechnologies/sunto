@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Native merge-queue cutover: the required "test" and "codex-clean" checks below must be
+  # able to resolve for a merge-group synthetic commit too, or the merge_queue ruleset rule
+  # can never admit anything (its required checks would simply never report). codex-clean's
+  # own job-level `if:` below only ever matches `pull_request` events, so it naturally skips
+  # (not fails) for merge_group -- and `test`'s own guard already treats a skipped codex-clean
+  # as fine to proceed, matching the same "already reviewed during the PR phase" reasoning
+  # wait-for-codex.yml's own merge_group pass-through uses.
+  merge_group:
+    types: [checks_requested]
 
 # wait-for-codex.yml's own concurrency group (keyed on PR number and event
 # name, cancel-in-progress: true) cancels an earlier push's "Wait for Codex

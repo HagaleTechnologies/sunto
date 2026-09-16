@@ -1,0 +1,190 @@
+name: Auto-Merge Trigger
+
+# Native merge-queue cutover: retires .mergify.yml. Mergify's own pull_request_rules "queue on
+# green + threads resolved" rule did two jobs at once -- (1) admitting a PR into its queue once
+# every check-success/thread-resolved/author condition held, and (2) actually performing the
+# merge. GitHub's native `merge_queue` ruleset rule (added to sunto's "main-protection" ruleset
+# alongside this PR) replaces job (2), but has no author-based admission control of its own --
+# something still has to call `gh pr merge` per PR, gated the same way Mergify's own rule was.
+#
+# This repo is PUBLIC with required_approving_review_count: 0 -- the trusted-author gate below
+# is not cosmetic. Without it, any outside contributor's PR that went green on both required
+# checks would auto-merge with zero human review. Mergify's own condition list (this repo's now-
+# superseded .mergify.yml) only ever admitted two cases: `author = thagale`, or a Dependabot PR
+# that (a) isn't labeled `needs-review` and (b) has a green `auto-merge` check-run (produced by
+# dependabot-auto-merge.yml's own classify step, which labels major bumps `needs-review` and
+# leaves minor/patch bumps unlabeled and auto-approved). Ported here exactly -- no
+# catalyst-cloud-connector[bot] entry (unlike some other repos in this fleet) since sunto's
+# Mergify config never had one.
+#
+# `needs-review`, not `needs-human`: this repo already had that label name from its pre-
+# migration Mergify config (applied to Dependabot major bumps, and available as a general
+# manual pause), so the native port keeps the existing name rather than introducing a second
+# one with the same role.
+on:
+  pull_request_target:
+    branches: [main]
+    # unlabeled/labeled (needs-review only, scoped in the job's own if: below): a maintainer
+    # manually applying or removing needs-review as an out-of-band pause needs to reach this
+    # job the same way an opened/synchronize event does, or the visible pause/resume signal is
+    # cosmetic and the PR can still merge (or stays stuck) regardless.
+    types: [opened, reopened, ready_for_review, synchronize, edited, unlabeled, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+  checks: read
+
+jobs:
+  auto-merge:
+    # `edited` scoped to a real base retarget only: `edited` fires on ANY PR edit (title, body,
+    # labels, base), but this job calls `gh pr merge` unconditionally for it, which could re-arm
+    # an unchanged head that just failed merge-group CI for reasons having nothing to do with
+    # that edit. `changes.base` is present on the edited event's payload only when the base
+    # branch itself changed.
+    #
+    # A matching `labeled`/`unlabeled` event (needs-review only) bypasses the author allowlist
+    # below -- queue-retry-handler.yml retries an already-admitted PR the same way regardless of
+    # author, and a needs-review pause/resume on one of those PRs needs to reach this job the
+    # same as an allowlisted one's. Coarse author check here is the webhook-delivery-time
+    # snapshot (good enough to skip obviously-ineligible PRs cheaply); the Dependabot branch's
+    # finer check-success=auto-merge condition is re-verified live inside the step below, since
+    # a job-level `if:` cannot evaluate a check-run's live conclusion.
+    if: |
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'edited' || github.event.changes.base != null) &&
+      (github.event.action != 'unlabeled' || github.event.label.name == 'needs-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'needs-review') &&
+      (
+        (github.event.action == 'labeled' && github.event.label.name == 'needs-review') ||
+        (github.event.action == 'unlabeled' && github.event.label.name == 'needs-review') ||
+        (
+          github.event.pull_request.user.login == 'thagale' ||
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        )
+      )
+    runs-on: ubuntu-latest
+    # Shared with queue-retry-handler.yml's own mutating job -- closes a TOCTOU race where this
+    # job could read needs-review as absent and merge moments after queue-retry-handler.yml
+    # handed the PR to a human. cancel-in-progress: false: a shared mutual-exclusion lock must
+    # let a queued run WAIT for the current holder to finish its full read-decide-act sequence,
+    # never cancel it mid-mutation.
+    concurrency:
+      group: auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # CODEX_REVIEW_PAT, not GITHUB_TOKEN: a merge attributed to GITHUB_TOKEN suppresses
+      # downstream push-triggered events (GitHub's anti-recursion guard) -- any push-triggered
+      # workflow needs to fire for a queue-merged commit exactly like any other push to main.
+      #
+      # needs-review is checked here, inside the run, via a fresh API fetch -- not in this job's
+      # own `if:` -- because `github.event.pull_request.labels` is a webhook-delivery-time
+      # snapshot, not a live read. If the label gets attached AFTER that snapshot but before this
+      # step actually runs, the stale snapshot still reads "no label" and this job would re-arm
+      # a PR already handed off to a human.
+      - name: Enable auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+        run: |
+          dequeue_and_disarm() {
+            gh pr merge "$PR_URL" --disable-auto >/dev/null 2>&1 || true
+            OWNER_PART="${REPO%%/*}"; NAME_PART="${REPO##*/}"
+            queue_state=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) { id isInMergeQueue }
+                }
+              }' -f owner="$OWNER_PART" -f name="$NAME_PART" -F pr="$PR" 2>/dev/null)
+            pr_node_id=$(printf '%s' "$queue_state" | jq -r '.data.repository.pullRequest.id')
+            in_queue=$(printf '%s' "$queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
+            if [ "$in_queue" = "true" ] && [ -n "$pr_node_id" ] && [ "$pr_node_id" != "null" ]; then
+              echo "::notice::PR #$PR is in the native merge queue (autoMergeRequest alone wouldn't have caught this) -- dequeuing."
+              gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pr_node_id" >/dev/null 2>&1 || true
+            fi
+          }
+          # Fail CLOSED (report "still armed/queued", i.e. unsafe) when the verification query
+          # itself can't be trusted -- called as an `if` condition, so a failed `gh api graphql`
+          # call (transient outage, same failure class that could have caused the dequeue attempt
+          # itself to fail) must not read as a successful disarm.
+          still_armed_or_queued() {
+            local state armed queued
+            OWNER_PART="${REPO%%/*}"; NAME_PART="${REPO##*/}"
+            if ! state=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) { autoMergeRequest { enabledAt } isInMergeQueue }
+                }
+              }' -f owner="$OWNER_PART" -f name="$NAME_PART" -F pr="$PR" 2>/dev/null); then
+              echo "::error::Could not fetch PR #$PR's live armed/queued state to verify disarm -- treating as unsafe (fail closed)." >&2
+              return 0
+            fi
+            armed=$(printf '%s' "$state" | jq -r '.data.repository.pullRequest.autoMergeRequest != null' 2>/dev/null)
+            queued=$(printf '%s' "$state" | jq -r '.data.repository.pullRequest.isInMergeQueue' 2>/dev/null)
+            if { [ "$armed" != "true" ] && [ "$armed" != "false" ]; } || { [ "$queued" != "true" ] && [ "$queued" != "false" ]; }; then
+              echo "::error::Could not parse PR #$PR's live armed/queued state to verify disarm -- treating as unsafe (fail closed)." >&2
+              return 0
+            fi
+            [ "$armed" = "true" ] || [ "$queued" = "true" ]
+          }
+
+          if [ "$EVENT_ACTION" = "labeled" ] && [ "$EVENT_LABEL" = "needs-review" ]; then
+            echo "::notice::needs-review was just attached to PR #$PR -- disarming any auto-merge that was already armed from an earlier event."
+            dequeue_and_disarm
+            if still_armed_or_queued; then
+              echo "::error::Could not fully disarm PR #$PR after needs-review was attached -- refusing to report success. Disarm by hand (gh pr merge $PR --disable-auto --repo $REPO, and dequeue via the PR's own UI if still queued) and confirm." >&2
+              exit 1
+            fi
+            exit 0
+          fi
+
+          # Live re-check of admission eligibility, immediately before mutating: the job-level
+          # `if:` above only does a coarse, webhook-snapshot-time author check -- it cannot see a
+          # live needs-review label or a live auto-merge check-run conclusion. Both are re-fetched
+          # here right before any merge/arm attempt.
+          current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+          if grep -qxF "needs-review" <<< "$current_labels"; then
+            echo "::notice::PR #$PR has needs-review attached -- standing down without arming; ensuring auto-merge is not armed/queued despite the label."
+            dequeue_and_disarm
+            if still_armed_or_queued; then
+              echo "::error::Could not fully disarm PR #$PR while needs-review is attached -- refusing to report success while it remains armed or queued. Disarm by hand and confirm." >&2
+              exit 1
+            fi
+            exit 0
+          fi
+
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+            auto_merge_conclusion=$(gh api "repos/${REPO}/commits/${PR_HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
+            if [ "$auto_merge_conclusion" != "success" ]; then
+              echo "::notice::PR #$PR is a Dependabot PR whose 'auto-merge' check-run is '${auto_merge_conclusion}', not success -- standing down without arming (classify workflow hasn't vetted this revision, or vetted it as needing review)."
+              exit 0
+            fi
+          elif [ "$PR_AUTHOR" != "thagale" ]; then
+            echo "::notice::PR #$PR's author ($PR_AUTHOR) is not on the trusted-author allowlist -- standing down without arming."
+            exit 0
+          fi
+
+          # Gated on the native merge_queue ruleset rule actually existing: without this check,
+          # `gh pr merge` on a repo with no merge_queue rule doesn't queue anything at all -- it
+          # just arms/performs an ordinary direct merge, with none of Mergify's own serialization
+          # or re-validation against a moving base. This keeps Mergify the sole admission path
+          # until the ruleset write lands, closing the two-queue window the same way every other
+          # repo in this fleet's rollout did.
+          merge_queue_live=$(gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
+          if [ "$merge_queue_live" != "true" ]; then
+            echo "::notice::No merge_queue ruleset rule exists yet for main -- standing down without arming native auto-merge on PR #$PR. Mergify's own queue is still the sole merge authority until the ruleset write lands."
+            exit 0
+          fi
+          current_base=$(gh pr view "$PR" --repo "${REPO}" --json baseRefName --jq .baseRefName)
+          if [ "$current_base" != "main" ]; then
+            echo "::notice::PR #$PR's base is '$current_base' (not main) as of this mutation attempt -- standing down without arming."
+            exit 0
+          fi
+          gh pr merge "$PR_URL" --auto --squash
