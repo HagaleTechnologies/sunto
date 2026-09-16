@@ -3,7 +3,9 @@
 # Dependabot-classification retrigger job (workflow_run-triggered, no PR-event context of its
 # own) can share one admission-attempt implementation instead of drifting apart.
 #
-# Required env: REPO, PR, PR_URL, PR_AUTHOR, PR_HEAD_SHA, GH_TOKEN (CODEX_REVIEW_PAT).
+# Required env: REPO, PR, PR_URL, GH_TOKEN (CODEX_REVIEW_PAT). PR_AUTHOR and PR_HEAD_SHA are
+# additionally required for the default (full admission-attempt) mode -- not needed when
+# called with `disarm-and-verify` as $1 (see below).
 set -euo pipefail
 
 dequeue_and_disarm() {
@@ -107,6 +109,23 @@ attempt_admission() {
   # wrong revision.
   gh pr merge "$PR_URL" --auto --squash --match-head-commit "$PR_HEAD_SHA"
 }
+
+# disarm-and-verify mode ($1): used by the `labeled: needs-review` handler in
+# auto-merge-trigger.yml, which only needs to disarm and confirm it -- not run the full
+# admission-attempt flow (which would immediately re-check the same label that's meant to
+# be blocking it). Verifying and failing loudly here (instead of the previous inline
+# implementation's swallowed-failure `|| true` with no check at all) closes a real gap: a
+# transient dequeue/disarm failure used to report success regardless, leaving a PR the
+# label claims is paused still armed or queued, since the native queue doesn't itself
+# enforce this label.
+if [ "${1:-}" = "disarm-and-verify" ]; then
+  dequeue_and_disarm
+  if still_armed_or_queued; then
+    echo "::error::Could not fully disarm PR #$PR after needs-review was attached -- refusing to report success. Disarm by hand (gh pr merge $PR --disable-auto --repo $REPO, and dequeue via the PR's own UI if still queued) and confirm." >&2
+    exit 1
+  fi
+  exit 0
+fi
 
 current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
 if grep -qxF "needs-review" <<< "$current_labels"; then

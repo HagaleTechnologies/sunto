@@ -95,26 +95,19 @@ jobs:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
       - name: Handle a manual needs-review label/unlabel event
-        if: github.event.action == 'labeled' || github.event.action == 'unlabeled'
+        # `labeled`: disarm and VERIFY it actually took (auto-merge-once.sh's
+        # disarm-and-verify mode fails the step outright if the PR is still armed/queued
+        # afterward -- the native queue doesn't itself enforce this label, so a swallowed
+        # transient dequeue failure here would otherwise leave a PR that visibly LOOKS
+        # paused still able to merge). `unlabeled`: nothing to disarm; falls through to the
+        # normal admission attempt in the next step.
+        if: github.event.action == 'labeled' && github.event.label.name == 'needs-review'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-        run: |
-          if [ "${{ github.event.action }}" = "labeled" ]; then
-            echo "::notice::needs-review was just attached to PR #$PR -- disarming any auto-merge that was already armed from an earlier event."
-            gh pr merge "$PR_URL" --disable-auto >/dev/null 2>&1 || true
-            OWNER_PART="${REPO%%/*}"; NAME_PART="${REPO##*/}"
-            queue_state=$(gh api graphql -f query='query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } } }' -f owner="$OWNER_PART" -f name="$NAME_PART" -F pr="$PR" 2>/dev/null)
-            pr_node_id=$(printf '%s' "$queue_state" | jq -r '.data.repository.pullRequest.id')
-            in_queue=$(printf '%s' "$queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
-            if [ "$in_queue" = "true" ] && [ -n "$pr_node_id" ] && [ "$pr_node_id" != "null" ]; then
-              gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pr_node_id" >/dev/null 2>&1 || true
-            fi
-          else
-            echo "::notice::needs-review was just removed from PR #$PR -- falling through to a normal admission attempt below."
-          fi
+        run: bash .github/scripts/auto-merge-once.sh disarm-and-verify
       # needs-review is checked (again) here, inside auto-merge-once.sh, via a fresh API fetch
       # -- not in this job's own `if:` -- because `github.event.pull_request.labels` is a
       # webhook-delivery-time snapshot, not a live read.
@@ -138,26 +131,23 @@ jobs:
   # own header comment for why this is necessary (the two workflows run concurrently off the
   # same PR event, so the first pass frequently finds the 'auto-merge' check-run still
   # absent/in-progress, and nothing else re-evaluates once it finishes).
-  retrigger-after-dependabot-classify:
+  #
+  # Split into a resolve job + a mutating job (same reason queue-retry-handler.yml's own
+  # parse-pr-number/check-pr-state split exists): a job-level `concurrency:` block can only
+  # reference `github`/`inputs`/`vars`/`needs`/`strategy`/`matrix` contexts, never a step
+  # output computed within that SAME job -- so the PR number has to be resolved in a
+  # predecessor job before it can be used to build a concurrency group key.
+  resolve-dependabot-pr:
     if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request_target'
     runs-on: ubuntu-latest
-    concurrency:
-      # PR number isn't in the workflow_run payload directly -- resolved inside the step
-      # below via the run's own associated pull_requests, but the concurrency group needs a
-      # `github`-context expression, so it keys on the workflow_run's own id instead. This
-      # doesn't share the auto-merge-${{ PR }} lock other jobs use, but the step below still
-      # re-checks live state (needs-review, auto-merge check-run, merge_queue, base) right
-      # before mutating, the same TOCTOU protection every other admission path relies on.
-      group: retrigger-dependabot-${{ github.event.workflow_run.id }}
-      cancel-in-progress: false
+    timeout-minutes: 2
+    outputs:
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          sparse-checkout: .github/scripts
-          sparse-checkout-cone-mode: false
-      - name: Resolve the associated PR and retry admission
+      - name: Resolve the associated PR from the completed run's head SHA
+        id: resolve
         env:
-          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
@@ -169,11 +159,37 @@ jobs:
           PR=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '[.[] | select(.state == "open")] | first | .number // empty')
           if [ -z "$PR" ]; then
             echo "::notice::No open PR found for commit $HEAD_SHA (already merged/closed, or not a PR head) -- nothing to retrigger."
-            exit 0
           fi
-          PR_URL=$(gh pr view "$PR" --repo "${REPO}" --json url --jq .url)
-          PR_AUTHOR=$(gh pr view "$PR" --repo "${REPO}" --json author --jq .author.login)
-          PR_HEAD_SHA=$(gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq .headRefOid)
+          echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+
+  retrigger-after-dependabot-classify:
+    needs: [resolve-dependabot-pr]
+    if: needs.resolve-dependabot-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    # Shares the SAME group auto-merge-trigger.yml's own main job uses (and
+    # queue-retry-handler.yml's mutating job) -- real mutual exclusion against a concurrent
+    # needs-review pause or retry-handler handoff for this exact PR, not just a live-state
+    # re-check that a race could still slip past. cancel-in-progress: false for the same
+    # reason every other job sharing this lock uses it: a queued run must WAIT for the
+    # current holder to finish its full read-decide-act sequence, never cancel it mid-mutation.
+    concurrency:
+      group: auto-merge-${{ needs.resolve-dependabot-pr.outputs.pr_number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Retry admission for the classified PR
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          READ_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.resolve-dependabot-pr.outputs.pr_number }}
+        run: |
+          PR_URL=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${REPO}" --json url --jq .url)
+          PR_AUTHOR=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${REPO}" --json author --jq .author.login)
+          PR_HEAD_SHA=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq .headRefOid)
           if [ "$PR_AUTHOR" != "dependabot[bot]" ]; then
             echo "::notice::PR #$PR's author ($PR_AUTHOR) is not dependabot[bot] -- this retrigger path only ever applies to Dependabot PRs, standing down."
             exit 0

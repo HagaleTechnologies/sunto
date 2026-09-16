@@ -125,6 +125,7 @@ jobs:
       stale: ${{ steps.pr-state.outputs.stale }}
       head_sha: ${{ steps.pr-state.outputs.head_sha }}
       head_sha12: ${{ steps.pr-state.outputs.head_sha12 }}
+      author: ${{ steps.pr-state.outputs.author }}
     steps:
       - name: Fetch the PR's real head SHA and determine whether it's safe to act
         id: pr-state
@@ -165,8 +166,14 @@ jobs:
               auto_merge_armed=true
             fi
           fi
+          author=$(echo "$pr_json" | jq -r .author.login)
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "head_sha12=$(echo "$head_sha" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          # From the same initial pr_json fetch as head_sha above (not re-fetched after the
+          # debounce sleep) -- self-consistent with the head_sha this job outputs either
+          # way: if the head changed during the debounce window, that's caught separately
+          # (stale=true below) and this author value is never used for a retry regardless.
+          echo "author=$author" >> "$GITHUB_OUTPUT"
 
           if [ "$pr_state" != "OPEN" ]; then
             echo "::notice::PR #$PR is no longer OPEN ($pr_state) -- nothing to act on."
@@ -338,6 +345,7 @@ jobs:
           LABEL: queue-retry-used:${{ needs.check-pr-state.outputs.head_sha12 }}
           HEAD_SHA12: ${{ needs.check-pr-state.outputs.head_sha12 }}
           HEAD_SHA: ${{ needs.check-pr-state.outputs.head_sha }}
+          PR_AUTHOR: ${{ needs.check-pr-state.outputs.author }}
         # This step's own script crossed 21,000 characters -- GitHub's own hard cap for ANY
         # run: block (see .github/scripts/queue-retry-once.sh's own header comment for the
         # full finding). This block has zero ${{ }} interpolation

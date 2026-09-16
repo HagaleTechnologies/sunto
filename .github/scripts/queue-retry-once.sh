@@ -210,14 +210,16 @@ if grep -qxF "needs-review" <<< "$current_labels"; then
   fi
 fi
 
-# Always CODEX_REVIEW_PAT, no author branching: this call never passes --admin, so it never
-# invokes the ruleset's own break-glass bypass actor regardless of who this PR's author is --
-# that bypass exists as a deliberately-exercised fallback for a stuck required check with no
-# other recovery, not something this routine retry path reaches for. GITHUB_TOKEN would work
-# equally for merge permissions, but a merge attributed to it suppresses the `push` event
-# GitHub's anti-recursion guard would otherwise fire on main (auto-merge-trigger.yml's own
-# header comment documents this exact failure mode) -- so CODEX_REVIEW_PAT avoids that
-# suppression uniformly.
+# Always CODEX_REVIEW_PAT for the merge call itself, no branching on author to pick a
+# different token: this call never passes --admin, so it never invokes the ruleset's own
+# break-glass bypass actor regardless of who this PR's author is -- that bypass exists as a
+# deliberately-exercised fallback for a stuck required check with no other recovery, not
+# something this routine retry path reaches for. GITHUB_TOKEN would work equally for merge
+# permissions, but a merge attributed to it suppresses the `push` event GitHub's
+# anti-recursion guard would otherwise fire on main (auto-merge-trigger.yml's own header
+# comment documents this exact failure mode) -- so CODEX_REVIEW_PAT avoids that suppression
+# uniformly. (The trusted-author GATE below is a separate, authorization concern -- whether
+# to merge at all -- not a token-selection one.)
 MERGE_TOKEN="$GH_TOKEN"
 
 # Re-check the merge_queue ruleset rule AND the base immediately before mutating
@@ -232,10 +234,33 @@ MERGE_TOKEN="$GH_TOKEN"
 # between these checks and the mutation call itself.
 merge_queue_live=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
 current_base=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
+
+# Reauthorize against the trusted-author gate before arming, not just re-checking
+# merge_queue/base: this handler exists to retry an ALREADY-admitted PR, but "already
+# admitted" is only true for the exact head that actually failed merge-group CI. If a
+# non-trusted-author push landed between that failure and check-pr-state's fetch (the
+# 10-second debounce above only catches a push landing DURING that window, not one
+# already present before the FIRST fetch), $HEAD_SHA/$PR_AUTHOR here silently describe
+# the replacement, unvetted revision -- and with required_approving_review_count: 0,
+# arming it unconditionally would let it merge having never gone through admission
+# control at all. Same authorization rule auto-merge-trigger.yml's own job-level `if:`
+# and attempt_admission() apply: thagale, or a Dependabot PR whose 'auto-merge'
+# check-run on THIS EXACT head is green.
+if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+  auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
+  head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
+elif [ "$PR_AUTHOR" = "thagale" ]; then
+  head_authorized=true
+else
+  head_authorized=false
+fi
+
 if [ "$merge_queue_live" != "true" ]; then
   echo "::notice::No merge_queue ruleset rule exists for main as of this retry attempt -- standing down without retrying or consuming this head's retry budget on PR #$PR."
 elif [ "$current_base" != "main" ]; then
   echo "::notice::PR #$PR's base changed to '$current_base' (was main) since pr-state ran -- auto-merge-trigger.yml itself would refuse this base too. Standing down without consuming this head's retry budget."
+elif [ "$head_authorized" != "true" ]; then
+  echo "::notice::PR #$PR's current head ($HEAD_SHA12, author $PR_AUTHOR) does not pass the trusted-author gate -- standing down without retrying or consuming this head's retry budget. If this head is legitimate, it needs to go through the normal admission path (auto-merge-trigger.yml), not this retry handler."
 elif GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA"; then
   # GH_TOKEN="$READ_TOKEN" here too: a successful merge call only proves
   # CODEX_REVIEW_PAT has pull-requests:write -- it says nothing about whether it
