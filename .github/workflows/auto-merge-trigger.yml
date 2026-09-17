@@ -148,6 +148,14 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Threaded through so attempt_admission() can distinguish "a maintainer just
+          # resumed a manually-admitted, non-allowlisted contributor's PR by removing its
+          # needs-review pause" (this job's own `if:` above already lets that specific event
+          # through the author allowlist) from a general admission attempt on a PR nobody
+          # has vetted -- the two need different author-gate behavior, and the script has no
+          # other way to tell them apart.
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
         run: bash .github/scripts/auto-merge-once.sh
 
   # Retrigger admission once Dependabot's own classify workflow completes -- see this file's

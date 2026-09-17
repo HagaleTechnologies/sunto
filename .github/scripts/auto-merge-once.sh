@@ -5,7 +5,9 @@
 #
 # Required env: REPO, PR, PR_URL, GH_TOKEN (CODEX_REVIEW_PAT). PR_AUTHOR and PR_HEAD_SHA are
 # additionally required for the default (full admission-attempt) mode -- not needed when
-# called with `disarm-and-verify` as $1 (see below).
+# called with `disarm-and-verify` as $1 (see below). EVENT_ACTION/EVENT_LABEL are optional
+# (unset when called from the workflow_run-triggered retrigger job, which has no PR-event
+# action at all) -- referenced with `${VAR:-}` wherever read, never required.
 set -euo pipefail
 
 # Fails CLOSED: echoes "unknown" (not "absent") when the labels API call itself fails, so a
@@ -130,8 +132,24 @@ attempt_admission() {
       return 0
     fi
   elif [ "$PR_AUTHOR" != "thagale" ]; then
-    echo "::notice::PR #$PR's author ($PR_AUTHOR) is not on the trusted-author allowlist -- standing down without arming."
-    return 0
+    # A maintainer removing needs-review from a PR they manually admitted despite its
+    # author not being on this allowlist (this job's own `if:` in auto-merge-trigger.yml
+    # already lets exactly that `unlabeled` event reach this script) is a trusted RESUME of
+    # a prior manual decision, not a fresh admission request -- the label removal is the
+    # signal to honor here, the same way auto-merge-trigger.yml's own `labeled` handling
+    # already treats a matching label event as authoritative regardless of author. Without
+    # this, the documented pause/resume flow for a manually-admitted outside contributor
+    # would leave the PR stuck: the earlier `labeled` event already disarmed it, so removing
+    # the label is the ONLY thing that could ever re-arm it, and this gate would reject that
+    # unconditionally based on authorship alone. EVENT_ACTION/EVENT_LABEL are unset (not
+    # just empty) when this function is reached from the workflow_run-triggered retrigger
+    # job, which has no PR-event action at all -- `${VAR:-}` avoids tripping `set -u` there.
+    if [ "${EVENT_ACTION:-}" = "unlabeled" ] && [ "${EVENT_LABEL:-}" = "needs-review" ]; then
+      echo "::notice::PR #$PR's author ($PR_AUTHOR) is not on the trusted-author allowlist, but this is a needs-review removal (a resume of a prior manual admission) -- proceeding."
+    else
+      echo "::notice::PR #$PR's author ($PR_AUTHOR) is not on the trusted-author allowlist -- standing down without arming."
+      return 0
+    fi
   fi
 
   merge_queue_live=$(gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
