@@ -483,18 +483,27 @@ jobs:
           if [ "$already_present" = "true" ]; then
             gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). needs-review was already attached before this handoff ran (from another source) -- not re-labeling or claiming provenance over it; the existing pause stands as-is." || true
           else
-            # Verified, not `|| true`-and-forget: if this comment fails to post, the label
-            # attached above has NO SHA provenance marker at all -- needs_review_is_stale()
-            # (in both auto-merge-once.sh and queue-retry-once.sh) can then never prove this
-            # handler owns the pause, so the advertised "push a fix" recovery silently never
-            # re-arms the PR without a human manually removing the label. Failing this step
-            # keeps the attempt from being marked handled, the same protection the label
+            # Verified by the POST's own response, not a `|| true`-and-forget or a
+            # text-only re-scan: if this comment fails to post, the label attached above has
+            # NO SHA provenance marker at all -- needs_review_is_stale() (in both
+            # auto-merge-once.sh and queue-retry-once.sh) can then never prove this handler
+            # owns the pause, so the advertised "push a fix" recovery silently never re-arms
+            # the PR without a human manually removing the label. Failing this step keeps
+            # the attempt from being marked handled, the same protection the label
             # attachment check just above already has.
+            #
+            # `gh api --method POST` directly, not `gh pr comment`: this SHA can already
+            # carry an OLDER marker comment from a previous handoff cycle for the exact same
+            # unchanged head (e.g. a maintainer removed a prior needs-review and the head got
+            # requeued) -- a text-only re-scan for "does a comment with this marker exist
+            # anywhere" would find that stale one and report success even if THIS post
+            # genuinely failed. Reading the new comment's own `.id` straight out of the
+            # POST's response is proof of exactly this invocation, not just that a
+            # same-text comment exists somewhere in the PR's history.
             marker_ok=false
-            if gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
-          <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" 2>/dev/null; then
-              recent_comments=$(gh api --paginate "repos/$REPO/issues/${PR}/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | .body' 2>/dev/null)
-              if grep -qF "queue-retry-handler:needs-review sha=$HEAD_SHA12" <<< "$recent_comments"; then
+            if new_comment_id=$(gh api --method POST "repos/$REPO/issues/${PR}/comments" -f body="Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
+          <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" --jq '.id' 2>/dev/null); then
+              if [ -n "$new_comment_id" ] && [ "$new_comment_id" != "null" ]; then
                 marker_ok=true
               fi
             fi

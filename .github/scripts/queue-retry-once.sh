@@ -259,7 +259,17 @@ MERGE_TOKEN="$GH_TOKEN"
 # still active. `gh pr merge --auto` also takes no base argument at all, it just arms
 # for the PR AS IT CURRENTLY EXISTS -- re-fetching both right here shrinks the window
 # between these checks and the mutation call itself.
-merge_queue_live=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
+# Exit status captured explicitly, not `|| echo false`: a transient auth/API failure on this
+# call is not the same fact as "the rule was confirmed absent," but `|| echo false` collapsed
+# them identically -- the retry step then read merge_queue_live=false, stood down "gracefully"
+# (exit 0, no retry, no handoff), and the calling workflow's "Mark this merge-group attempt as
+# handled" step saw that success and marked the attempt handled anyway. A later redelivery of
+# the SAME merge-group event is then deduplicated against that marker, so the PR stays silently
+# disarmed with no retry, no handoff, and no further chance to notice.
+if ! merge_queue_live=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null); then
+  echo "::error::Could not confirm whether the merge_queue ruleset rule exists for main (rules/branches/main API call failed) -- failing this step rather than risking marking a genuinely-actionable attempt as handled." >&2
+  exit 1
+fi
 current_base=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
 
 # Reauthorize the Dependabot case specifically before arming, not just re-checking
