@@ -32,21 +32,24 @@ name: Auto-Merge Trigger
 # event occurs just because a sibling workflow finished.
 on:
   pull_request_target:
-    # No `branches: [main]` filter, deliberately: that filter is evaluated against the PR's
-    # CURRENT base at delivery time, so a retarget FROM main TO some other branch (an
-    # `edited` event whose new base isn't main) would be excluded before this workflow ever
-    # ran at all -- meaning an already-armed PR retargeted away from main by anyone with
-    # write access could stay armed/queued with none of main's gating applying to its new
-    # base, and this workflow would never even see the event to disarm it. Scoping to main
-    # happens at runtime instead, inside attempt_admission()'s own current_base check (which
-    # now disarms, not just declines to arm, when the live base isn't main) -- the cost is
-    # this job also runs harmlessly (and stands down immediately) for PRs that target some
-    # other branch entirely, never armed in the first place.
-    #
+    branches: [main]
     # unlabeled/labeled (needs-review only, scoped in the job's own if: below): a maintainer
     # manually applying or removing needs-review as an out-of-band pause needs to reach this
     # job the same way an opened/synchronize event does, or the visible pause/resume signal is
     # cosmetic and the PR can still merge (or stays stuck) regardless.
+    #
+    # KNOWN GAP, accepted deliberately (2026-09-17): a PR retargeted away from main while
+    # already armed or sitting in the native merge queue is NOT automatically disarmed. An
+    # earlier version of this file actively disarmed that case -- three review rounds each
+    # surfaced a deeper, genuinely real bug in that one code path (a disarm ordering bug that
+    # let an untrusted-author PR slip past the disarm entirely, a job-trigger gating gap with
+    # the same effect, and a checkout-ref bug that could make the disarm attempt fail before
+    # running anything). Backed out rather than keep layering fixes on a low-value edge case:
+    # worst case here is a stale queue/armed-auto-merge entry against a non-main base, which
+    # needs a manual `gh pr merge --disable-auto` (and dequeue via the PR's own UI if still
+    # queued) to clear -- inconvenient, not a security hole, since main's own required checks
+    # and merge_queue rule simply don't apply to whatever the PR's new base is. Tracked as
+    # follow-up issue https://github.com/HagaleTechnologies/sunto/issues/25.
     types: [opened, reopened, ready_for_review, synchronize, edited, unlabeled, labeled]
   workflow_run:
     workflows: ['Dependabot Auto-Merge']
@@ -76,19 +79,13 @@ jobs:
     # that edit. `changes.base` is present on the edited event's payload only when the base
     # branch itself changed.
     #
-    # A matching `labeled`/`unlabeled` event (needs-review only), OR a real base-retarget
-    # `edited` event, bypasses the author allowlist below. The retarget case matters just as
-    # much as the label case: this job's OWN check tests the PR's AUTHOR, not who performed
-    # the edit -- an outside contributor's PR (never eligible to arm on its own) can still
-    # have been manually armed by someone with write access, then retargeted away from main
-    # by anyone with write access too. Without this bypass, that retarget event would never
-    # even start this job at all, so attempt_admission()'s own base-retarget disarm logic
-    # (which now runs before its author gate, for exactly this reason) would never run either
-    # -- the two fixes only work together. Coarse author check here is the
-    # webhook-delivery-time snapshot (good enough to skip obviously-ineligible PRs cheaply);
-    # the Dependabot branch's finer check-success=auto-merge condition is re-verified live
-    # inside auto-merge-once.sh, since a job-level `if:` cannot evaluate a check-run's live
-    # conclusion.
+    # A matching `labeled`/`unlabeled` event (needs-review only) bypasses the author allowlist
+    # below -- queue-retry-handler.yml retries an already-admitted PR the same way regardless of
+    # author, and a needs-review pause/resume on one of those PRs needs to reach this job the
+    # same as an allowlisted one's. Coarse author check here is the webhook-delivery-time
+    # snapshot (good enough to skip obviously-ineligible PRs cheaply); the Dependabot branch's
+    # finer check-success=auto-merge condition is re-verified live inside auto-merge-once.sh,
+    # since a job-level `if:` cannot evaluate a check-run's live conclusion.
     if: |
       github.event_name == 'pull_request_target' &&
       github.event.pull_request.draft == false &&
@@ -98,7 +95,6 @@ jobs:
       (
         (github.event.action == 'labeled' && github.event.label.name == 'needs-review') ||
         (github.event.action == 'unlabeled' && github.event.label.name == 'needs-review') ||
-        (github.event.action == 'edited' && github.event.changes.base != null) ||
         (
           github.event.pull_request.user.login == 'thagale' ||
           github.event.pull_request.user.login == 'dependabot[bot]'
@@ -117,20 +113,8 @@ jobs:
       # CODEX_REVIEW_PAT, not GITHUB_TOKEN: a merge attributed to GITHUB_TOKEN suppresses
       # downstream push-triggered events (GitHub's anti-recursion guard) -- any push-triggered
       # workflow needs to fire for a queue-merged commit exactly like any other push to main.
-      #
-      # ref: main, explicit -- NOT the implicit default. actions/checkout's default ref for a
-      # pull_request_target event tracks the PR's CURRENT base (github.sha for this trigger is
-      # the base branch's own tip, not the PR's head) -- for the exact base-retarget `edited`
-      # event this job's disarm logic exists to handle, that base is, by definition, whatever
-      # the PR was JUST retargeted to, not main. An implicit checkout would fetch THAT branch's
-      # tree instead, which may not carry .github/scripts/auto-merge-once.sh at all (it only
-      # exists on main after this PR merges) -- failing the very first step of the disarm
-      # attempt before it runs anything. Pinning to main guarantees the trusted, known-good
-      # copy of the handler is what actually executes, regardless of what the PR's live base
-      # currently is.
       - uses: actions/checkout@v7
         with:
-          ref: main
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
       - name: Handle a manual needs-review label/unlabel event
