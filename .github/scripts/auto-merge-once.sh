@@ -149,6 +149,22 @@ attempt_admission() {
     echo "::notice::PR #$PR's base is '$current_base' (not main) as of this mutation attempt -- standing down without arming."
     return 0
   fi
+  # Re-check needs-review immediately before mutating, not just once at the top of the
+  # script: every check above this point (the Dependabot check-run lookup, merge_queue_live,
+  # current_base) costs real wall-clock time, during which a concurrent event -- the
+  # classifier attaching needs-review for a major update (dependabot-auto-merge.yml), or a
+  # maintainer manually pausing an already-green PR -- can land needs-review after the
+  # original read but before this call. `gh pr merge --help` confirms that once required
+  # checks have already passed, this call adds the PR directly to the native merge queue,
+  # which doesn't itself enforce needs-review at all -- so a pause applied in that window
+  # would have no effect unless caught here. Deliberately only needs-review, matching
+  # admission's actual rule elsewhere in this function (see the major-update comment above);
+  # not re-running every check from scratch, just closing the specific window this call
+  # itself is exposed to.
+  if [ "$(label_state needs-review)" != "absent" ]; then
+    echo "::notice::PR #$PR now has needs-review attached (applied after this attempt's original label read) -- standing down without arming."
+    return 0
+  fi
   # --match-head-commit: without it, a Dependabot PR pushed AFTER PR_HEAD_SHA was captured
   # (and validated above) but BEFORE this call executes could get armed against its new,
   # unclassified head instead of the one whose 'auto-merge' check-run was actually checked --

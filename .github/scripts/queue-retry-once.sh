@@ -305,6 +305,16 @@ elif [ "$current_base" != "main" ]; then
   echo "::notice::PR #$PR's base changed to '$current_base' (was main) since pr-state ran -- auto-merge-trigger.yml itself would refuse this base too. Standing down without consuming this head's retry budget."
 elif [ "$head_authorized" != "true" ]; then
   echo "::notice::PR #$PR's current head ($HEAD_SHA12, author $PR_AUTHOR) does not pass the trusted-author gate -- standing down without retrying or consuming this head's retry budget. If this head is legitimate, it needs to go through the normal admission path (auto-merge-trigger.yml), not this retry handler."
+# Re-checked immediately before mutating, not just via the needs-review branch at the top of
+# this script: every check between there and here (merge_queue_live, current_base, the
+# Dependabot reauthorization) costs real wall-clock time, during which a concurrent event
+# (dependabot-auto-merge.yml attaching needs-review for a major update, or a maintainer
+# manually pausing an already-green PR) can land needs-review after the original read but
+# before this call. Once required checks have already passed, `gh pr merge` adds the PR
+# directly to the native merge queue, which doesn't itself enforce needs-review -- so a pause
+# applied in that window would have no effect unless caught here.
+elif [ "$(label_state needs-review)" != "absent" ]; then
+  echo "::notice::PR #$PR now has needs-review attached (applied after this retry's original label read) -- standing down without consuming this head's retry budget."
 elif GH_TOKEN="$MERGE_TOKEN" gh pr merge "$PR" --repo "$REPO" --auto --squash --match-head-commit "$HEAD_SHA"; then
   # GH_TOKEN="$READ_TOKEN" here too: a successful merge call only proves
   # CODEX_REVIEW_PAT has pull-requests:write -- it says nothing about whether it
