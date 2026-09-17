@@ -1,0 +1,234 @@
+name: Auto-Merge Trigger
+
+# Native merge-queue cutover: retires .mergify.yml. Mergify's own pull_request_rules "queue on
+# green + threads resolved" rule did two jobs at once -- (1) admitting a PR into its queue once
+# every check-success/thread-resolved/author condition held, and (2) actually performing the
+# merge. GitHub's native `merge_queue` ruleset rule (added to sunto's "main-protection" ruleset
+# alongside this PR) replaces job (2), but has no author-based admission control of its own --
+# something still has to call `gh pr merge` per PR, gated the same way Mergify's own rule was.
+#
+# This repo is PUBLIC with required_approving_review_count: 0 -- the trusted-author gate below
+# is not cosmetic. Without it, any outside contributor's PR that went green on both required
+# checks would auto-merge with zero human review. Mergify's own condition list (this repo's now-
+# superseded .mergify.yml) only ever admitted two cases: `author = thagale`, or a Dependabot PR
+# that (a) isn't labeled `needs-review` and (b) has a green `auto-merge` check-run (produced by
+# dependabot-auto-merge.yml's own classify step, which labels major bumps `needs-review` and
+# leaves minor/patch bumps unlabeled and auto-approved). Ported here exactly -- no
+# catalyst-cloud-connector[bot] entry (unlike some other repos in this fleet) since sunto's
+# Mergify config never had one.
+#
+# `needs-review`, not `needs-human`: this repo already had that label name from its pre-
+# migration Mergify config (applied to Dependabot major bumps, and available as a general
+# manual pause), so the native port keeps the existing name rather than introducing a second
+# one with the same role.
+#
+# Mergify re-evaluated its conditions continuously (any relevant status change, not just a PR
+# event), which is why the `workflow_run` trigger below exists: `dependabot-auto-merge.yml`'s
+# own classify step runs concurrently with (not before) this workflow's `pull_request_target`
+# run on the same `opened`/`synchronize` event, so its `auto-merge` check-run is frequently
+# still absent/in-progress the moment this job checks it. Without a second, completion-
+# triggered path, a minor/patch Dependabot PR that gets classified a few seconds AFTER this
+# job already stood down would never be re-evaluated by anything -- no further PR-lifecycle
+# event occurs just because a sibling workflow finished.
+on:
+  pull_request_target:
+    branches: [main]
+    # unlabeled/labeled (needs-review only, scoped in the job's own if: below): a maintainer
+    # manually applying or removing needs-review as an out-of-band pause needs to reach this
+    # job the same way an opened/synchronize event does, or the visible pause/resume signal is
+    # cosmetic and the PR can still merge (or stays stuck) regardless.
+    #
+    # KNOWN GAP, accepted deliberately (2026-09-17): a PR retargeted away from main while
+    # already armed or sitting in the native merge queue is NOT automatically disarmed. An
+    # earlier version of this file actively disarmed that case -- three review rounds each
+    # surfaced a deeper, genuinely real bug in that one code path (a disarm ordering bug that
+    # let an untrusted-author PR slip past the disarm entirely, a job-trigger gating gap with
+    # the same effect, and a checkout-ref bug that could make the disarm attempt fail before
+    # running anything). Backed out rather than keep layering fixes on a low-value edge case:
+    # worst case here is a stale queue/armed-auto-merge entry against a non-main base, which
+    # needs a manual `gh pr merge --disable-auto` (and dequeue via the PR's own UI if still
+    # queued) to clear -- inconvenient, not a security hole, since main's own required checks
+    # and merge_queue rule simply don't apply to whatever the PR's new base is. Tracked as
+    # follow-up issue https://github.com/HagaleTechnologies/sunto/issues/25.
+    types: [opened, reopened, ready_for_review, synchronize, edited, unlabeled, labeled]
+  workflow_run:
+    workflows: ['Dependabot Auto-Merge']
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+  checks: read
+
+jobs:
+  # `enable-auto-merge`, not `auto-merge`: dependabot-auto-merge.yml's own job is ALSO named
+  # `auto-merge` (its job id, with no explicit `name:` override, same as this job originally
+  # had) -- both would otherwise produce a check-run literally named "auto-merge" on the same
+  # commit. attempt_admission()'s Dependabot branch (in auto-merge-once.sh) and
+  # queue-retry-once.sh's trusted-author reauthorization both select check-runs by that exact
+  # name to read the classifier's verdict -- a name collision meant either query could pick up
+  # THIS job's own (unrelated) check-run instead and misread it as "classifier says this
+  # Dependabot PR is vetted," potentially arming an unclassified/major bump. Renaming this job
+  # (not dependabot-auto-merge.yml's, which is out of scope for this migration) resolves the
+  # collision at the source, for every consumer of that check-run name at once.
+  enable-auto-merge:
+    # `edited` scoped to a real base retarget only: `edited` fires on ANY PR edit (title, body,
+    # labels, base), but this job calls `gh pr merge` unconditionally for it, which could re-arm
+    # an unchanged head that just failed merge-group CI for reasons having nothing to do with
+    # that edit. `changes.base` is present on the edited event's payload only when the base
+    # branch itself changed.
+    #
+    # A matching `labeled`/`unlabeled` event (needs-review only) bypasses the author allowlist
+    # below -- queue-retry-handler.yml retries an already-admitted PR the same way regardless of
+    # author, and a needs-review pause/resume on one of those PRs needs to reach this job the
+    # same as an allowlisted one's. Coarse author check here is the webhook-delivery-time
+    # snapshot (good enough to skip obviously-ineligible PRs cheaply); the Dependabot branch's
+    # finer check-success=auto-merge condition is re-verified live inside auto-merge-once.sh,
+    # since a job-level `if:` cannot evaluate a check-run's live conclusion.
+    if: |
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'edited' || github.event.changes.base != null) &&
+      (github.event.action != 'unlabeled' || github.event.label.name == 'needs-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'needs-review') &&
+      (
+        (github.event.action == 'labeled' && github.event.label.name == 'needs-review') ||
+        (github.event.action == 'unlabeled' && github.event.label.name == 'needs-review') ||
+        (
+          github.event.pull_request.user.login == 'thagale' ||
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        )
+      )
+    runs-on: ubuntu-latest
+    # Shared with queue-retry-handler.yml's own mutating job AND the retrigger job below --
+    # closes a TOCTOU race where any one of these could read needs-review as absent and merge
+    # moments after another handed the PR to a human. cancel-in-progress: false: a shared
+    # mutual-exclusion lock must let a queued run WAIT for the current holder to finish its
+    # full read-decide-act sequence, never cancel it mid-mutation.
+    concurrency:
+      group: auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # CODEX_REVIEW_PAT, not GITHUB_TOKEN: a merge attributed to GITHUB_TOKEN suppresses
+      # downstream push-triggered events (GitHub's anti-recursion guard) -- any push-triggered
+      # workflow needs to fire for a queue-merged commit exactly like any other push to main.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Handle a manual needs-review label/unlabel event
+        # `labeled`: disarm and VERIFY it actually took (auto-merge-once.sh's
+        # disarm-and-verify mode fails the step outright if the PR is still armed/queued
+        # afterward -- the native queue doesn't itself enforce this label, so a swallowed
+        # transient dequeue failure here would otherwise leave a PR that visibly LOOKS
+        # paused still able to merge). `unlabeled`: nothing to disarm; falls through to the
+        # normal admission attempt in the next step.
+        if: github.event.action == 'labeled' && github.event.label.name == 'needs-review'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/auto-merge-once.sh disarm-and-verify
+      # needs-review is checked (again) here, inside auto-merge-once.sh, via a fresh API fetch
+      # -- not in this job's own `if:` -- because `github.event.pull_request.labels` is a
+      # webhook-delivery-time snapshot, not a live read.
+      - name: Enable auto-merge
+        # Skip the whole attempt when this was just a `labeled: needs-review` pause -- the
+        # step above already disarmed; running the admission attempt too would immediately
+        # try to re-check/re-arm against a label that (correctly) blocks it, which is
+        # harmless but redundant. `unlabeled` DOES fall through (removing the pause should
+        # trigger a fresh attempt).
+        if: '!(github.event.action == ''labeled'' && github.event.label.name == ''needs-review'')'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Threaded through so attempt_admission() can distinguish "a maintainer just
+          # resumed a manually-admitted, non-allowlisted contributor's PR by removing its
+          # needs-review pause" (this job's own `if:` above already lets that specific event
+          # through the author allowlist) from a general admission attempt on a PR nobody
+          # has vetted -- the two need different author-gate behavior, and the script has no
+          # other way to tell them apart.
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+        run: bash .github/scripts/auto-merge-once.sh
+
+  # Retrigger admission once Dependabot's own classify workflow completes -- see this file's
+  # own header comment for why this is necessary (the two workflows run concurrently off the
+  # same PR event, so the first pass frequently finds the 'auto-merge' check-run still
+  # absent/in-progress, and nothing else re-evaluates once it finishes).
+  #
+  # Split into a resolve job + a mutating job (same reason queue-retry-handler.yml's own
+  # parse-pr-number/check-pr-state split exists): a job-level `concurrency:` block can only
+  # reference `github`/`inputs`/`vars`/`needs`/`strategy`/`matrix` contexts, never a step
+  # output computed within that SAME job -- so the PR number has to be resolved in a
+  # predecessor job before it can be used to build a concurrency group key.
+  resolve-dependabot-pr:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+    steps:
+      - name: Resolve the associated PR from the completed run's head SHA
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Read directly from the event payload, not a `GET /actions/runs/{id}` call: that
+          # endpoint needs `actions: read`, a scope this workflow doesn't otherwise need and
+          # doesn't grant -- the call would 403, HEAD_SHA would never be set, and this whole
+          # retrigger path would silently never fire for any Dependabot PR. The event payload
+          # already carries the completed run's own head_sha directly.
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # github.event.workflow_run.pull_requests is populated by GitHub for a same-repo PR
+          # (Dependabot PRs always are -- never a fork), but resolve the PR from the run's own
+          # head SHA via the commits/pulls lookup regardless, rather than trusting that
+          # webhook-delivery-time array, since a retry/rerun of the classify workflow could be
+          # evaluating an already-superseded head.
+          PR=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '[.[] | select(.state == "open")] | first | .number // empty')
+          if [ -z "$PR" ]; then
+            echo "::notice::No open PR found for commit $HEAD_SHA (already merged/closed, or not a PR head) -- nothing to retrigger."
+          fi
+          echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+
+  retrigger-after-dependabot-classify:
+    needs: [resolve-dependabot-pr]
+    if: needs.resolve-dependabot-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    # Shares the SAME group auto-merge-trigger.yml's own main job uses (and
+    # queue-retry-handler.yml's mutating job) -- real mutual exclusion against a concurrent
+    # needs-review pause or retry-handler handoff for this exact PR, not just a live-state
+    # re-check that a race could still slip past. cancel-in-progress: false for the same
+    # reason every other job sharing this lock uses it: a queued run must WAIT for the
+    # current holder to finish its full read-decide-act sequence, never cancel it mid-mutation.
+    concurrency:
+      group: auto-merge-${{ needs.resolve-dependabot-pr.outputs.pr_number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Retry admission for the classified PR
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          READ_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.resolve-dependabot-pr.outputs.pr_number }}
+        run: |
+          PR_URL=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${REPO}" --json url --jq .url)
+          PR_AUTHOR=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${REPO}" --json author --jq .author.login)
+          PR_HEAD_SHA=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq .headRefOid)
+          if [ "$PR_AUTHOR" != "dependabot[bot]" ]; then
+            echo "::notice::PR #$PR's author ($PR_AUTHOR) is not dependabot[bot] -- this retrigger path only ever applies to Dependabot PRs, standing down."
+            exit 0
+          fi
+          export PR PR_URL PR_AUTHOR PR_HEAD_SHA
+          bash .github/scripts/auto-merge-once.sh
