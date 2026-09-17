@@ -303,7 +303,15 @@ if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
   # itself. major-update is still checked -- inside needs_human_is_stale() above -- to stop
   # THAT function's own staleness-clearing logic from auto-clearing a pause the classifier
   # still actively wants; that's a narrower, different concern than gating here a second time.
-  auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
+  # Exit status captured explicitly, same fix as the merge_queue_live check above in this
+  # file: a genuine API failure here used to collapse into the same "absent" as a confirmed
+  # missing check-run, silently setting head_authorized=false and letting the retry stand
+  # down "successfully" -- which the calling workflow then marks handled, the identical
+  # silent-permanent-stall risk merge_queue_live's fix above closes.
+  if ! auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null); then
+    echo "::error::Could not confirm the Dependabot 'auto-merge' check-run's conclusion for PR #$PR (check-runs API call failed) -- failing this step rather than risking marking a genuinely-actionable attempt as handled." >&2
+    exit 1
+  fi
   head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
 else
   head_authorized=true

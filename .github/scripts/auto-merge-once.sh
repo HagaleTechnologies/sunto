@@ -126,7 +126,16 @@ attempt_admission() {
     # checked -- inside needs_review_is_stale() above -- to stop this function's OWN
     # staleness-clearing logic from auto-clearing a pause the classifier still actively
     # wants; that's a different, narrower concern than gating admission here a second time.
-    auto_merge_conclusion=$(gh api "repos/${REPO}/commits/${PR_HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
+    # Exit status captured explicitly, same fix as the merge_queue_live check below: the
+    # `// "absent"` inside the --jq filter already correctly handles "the API call succeeded
+    # but no auto-merge check-run exists yet" (a real, expected state for a brand-new
+    # Dependabot PR) -- but `2>/dev/null || echo "absent"` around the WHOLE call used to also
+    # collapse a genuine API failure into that identical string, silently standing down on an
+    # unknown state the same as a confirmed one, with the same one-shot-event liveness risk.
+    if ! auto_merge_conclusion=$(gh api "repos/${REPO}/commits/${PR_HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null); then
+      echo "::error::Could not confirm the Dependabot 'auto-merge' check-run's conclusion for PR #$PR (check-runs API call failed) -- failing rather than silently standing down on an unknown state." >&2
+      exit 1
+    fi
     if [ "$auto_merge_conclusion" != "success" ]; then
       echo "::notice::PR #$PR is a Dependabot PR whose 'auto-merge' check-run is '${auto_merge_conclusion}', not success -- standing down without arming (classify workflow hasn't vetted this revision, or vetted it as needing review)."
       return 0
@@ -152,7 +161,19 @@ attempt_admission() {
     fi
   fi
 
-  merge_queue_live=$(gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
+  # Exit status captured explicitly, not `|| echo false` -- same fix as queue-retry-once.sh's
+  # identical check. A transient auth/API failure here is not the same fact as "the rule was
+  # confirmed absent," but the two used to collapse identically, silently standing down as if
+  # nothing needs arming. That's a real, not just theoretical, gap for two of this function's
+  # callers specifically: `opened` is a one-time PR-lifecycle event with no guaranteed future
+  # retry the way `synchronize`/`labeled`/`unlabeled` are, and the Dependabot-classify
+  # retrigger job (auto-merge-trigger.yml) only ever fires once per classify-workflow
+  # completion -- for either, a transient failure here can mean this PR never gets another
+  # chance to be evaluated at all, not just a delayed one.
+  if ! merge_queue_live=$(gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null); then
+    echo "::error::Could not confirm whether the merge_queue ruleset rule exists for main (rules/branches/main API call failed) -- failing rather than silently standing down on an unknown state." >&2
+    exit 1
+  fi
   if [ "$merge_queue_live" != "true" ]; then
     echo "::notice::No merge_queue ruleset rule exists yet for main -- standing down without arming native auto-merge on PR #$PR. Mergify's own queue is still the sole merge authority until the ruleset write lands."
     return 0
