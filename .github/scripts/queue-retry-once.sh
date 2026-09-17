@@ -19,6 +19,22 @@ set -eo pipefail
 #   GH_TOKEN, READ_TOKEN, PR, LABEL, HEAD_SHA12, HEAD_SHA, GITHUB_REPOSITORY (implicit) or REPO
 REPO="${REPO:-$GITHUB_REPOSITORY}"
 
+# Fails CLOSED: echoes "unknown" (not "absent") when the labels API call itself fails, so a
+# transient failure can't be silently read as "the label isn't there." Every call site below
+# must treat "unknown" the same as (or more conservatively than) "present," never "absent."
+label_state() {
+  local label="$1" labels
+  if ! labels=$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name' 2>/dev/null); then
+    echo "unknown"
+    return
+  fi
+  if grep -qxF "$label" <<< "$labels"; then
+    echo "present"
+  else
+    echo "absent"
+  fi
+}
+
 # Shared by both fail-closed branches below: a bare needs-review POST with `|| true`
 # would let this whole step report success even when the ONE signal meant to get a
 # human's attention never landed. Verify it, and propagate failure via this
@@ -191,8 +207,9 @@ needs_human_is_stale() {
   # regardless of what the marker-provenance checks above concluded -- a concurrent
   # reclassification onto a new head can re-attach an already-present needs-review with no
   # fresh `labeled` timeline event at all, which would otherwise let this function clear a
-  # pause the classifier still actively wants.
-  if grep -qxF "major-update" <<< "$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+  # pause the classifier still actively wants. Fail closed on "unknown" too (the API call
+  # itself failed) -- treat it the same as "present," not "absent."
+  if [ "$(label_state major-update)" != "absent" ]; then
     return 1
   fi
   return 0
@@ -245,34 +262,44 @@ MERGE_TOKEN="$GH_TOKEN"
 merge_queue_live=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
 current_base=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
 
-# Reauthorize against the trusted-author gate before arming, not just re-checking
-# merge_queue/base: this handler exists to retry an ALREADY-admitted PR, but "already
-# admitted" is only true for the exact head that actually failed merge-group CI. If a
-# non-trusted-author push landed between that failure and check-pr-state's fetch (the
-# 10-second debounce above only catches a push landing DURING that window, not one
-# already present before the FIRST fetch), $HEAD_SHA/$PR_AUTHOR here silently describe
-# the replacement, unvetted revision -- and with required_approving_review_count: 0,
-# arming it unconditionally would let it merge having never gone through admission
-# control at all. Same authorization rule auto-merge-trigger.yml's own job-level `if:`
-# and attempt_admission() apply: thagale, or a Dependabot PR whose 'auto-merge'
-# check-run on THIS EXACT head is green.
+# Reauthorize the Dependabot case specifically before arming, not just re-checking
+# merge_queue/base: unlike a human-authored PR (a static trust decision that doesn't change
+# mid-PR), a Dependabot bump's minor-vs-major CLASSIFICATION can differ between admission
+# time and this retry, even for the exact same, unchanged head -- dependabot-auto-merge.yml's
+# classify step can complete concurrently with (not strictly before) this handler's own read,
+# and reclassification is a genuinely live risk this specific author needs re-checked, not a
+# one-time admission fact.
+#
+# Every OTHER author (thagale, or an outside contributor a maintainer manually admitted) is
+# NOT rejected here based on identity alone -- round 2 of this rollout's own review originally
+# added a blanket "author must be thagale or a vetted Dependabot bump" rejection, intended to
+# close a narrow replacement-push race (a non-trusted push landing before check-pr-state's
+# very FIRST fetch, before the debounce above ever got a chance to observe it). That fix
+# overcorrected: it also rejected the much more common, entirely legitimate case of a
+# manually-admitted outside contributor's UNCHANGED head just failing merge-group CI and
+# needing a normal retry -- silently disarming it with no retry and no handoff, since
+# `head_authorized=false` for that author falls through to a no-op standdown below, not a
+# needs-review handoff. check-pr-state's own debounce (comparing the head SHA across a 10s
+# wait) already catches the realistic version of that race -- a push landing DURING the
+# window it observes -- leaving only the narrower, harder-to-close "already there before the
+# very first fetch" edge case unprotected either way. Trusting that debounce here, same as
+# the original design before round 2, is the better trade-off for the common case.
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
   # 'success' on the auto-merge check-run only means dependabot-auto-merge.yml's classify
   # job ran without erroring -- it reports success on BOTH its minor/patch and major-update
   # branches, so it's never proof by itself that this head isn't a major bump. major-update
   # is the actual positive signal; check its CURRENT presence directly, independent of the
   # staleness guard above (belt and suspenders against the exact same collapse-to-false gap
-  # auto-merge-once.sh's attempt_admission() closes the same way).
-  if grep -qxF "major-update" <<< "$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+  # auto-merge-once.sh's attempt_admission() closes the same way). Fail closed on "unknown"
+  # too (the labels API call itself failed) -- treat it the same as "present."
+  if [ "$(label_state major-update)" != "absent" ]; then
     head_authorized=false
   else
     auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
     head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
   fi
-elif [ "$PR_AUTHOR" = "thagale" ]; then
-  head_authorized=true
 else
-  head_authorized=false
+  head_authorized=true
 fi
 
 if [ "$merge_queue_live" != "true" ]; then

@@ -483,8 +483,25 @@ jobs:
           if [ "$already_present" = "true" ]; then
             gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). needs-review was already attached before this handoff ran (from another source) -- not re-labeling or claiming provenance over it; the existing pause stands as-is." || true
           else
-            gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
-          <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" || true
+            # Verified, not `|| true`-and-forget: if this comment fails to post, the label
+            # attached above has NO SHA provenance marker at all -- needs_review_is_stale()
+            # (in both auto-merge-once.sh and queue-retry-once.sh) can then never prove this
+            # handler owns the pause, so the advertised "push a fix" recovery silently never
+            # re-arms the PR without a human manually removing the label. Failing this step
+            # keeps the attempt from being marked handled, the same protection the label
+            # attachment check just above already has.
+            marker_ok=false
+            if gh pr comment "$PR" --repo "$REPO" --body "Merge-group CI failed again for commit \`$HEAD_SHA12\` after its one automatic retry ([run]($RUN_URL)). Not retrying again -- this needs a human decision: push a fix, or investigate and manually re-run \`gh pr merge --auto --squash\` if it's a known flake.
+          <!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" 2>/dev/null; then
+              recent_comments=$(gh api --paginate "repos/$REPO/issues/${PR}/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | .body' 2>/dev/null)
+              if grep -qF "queue-retry-handler:needs-review sha=$HEAD_SHA12" <<< "$recent_comments"; then
+                marker_ok=true
+              fi
+            fi
+            if [ "$marker_ok" != "true" ]; then
+              echo "::error::Could not confirm the SHA provenance marker comment landed for PR #$PR (commit $HEAD_SHA12) -- failing this step so the attempt isn't marked handled." >&2
+              exit 1
+            fi
           fi
 
       - name: Mark this merge-group attempt as handled

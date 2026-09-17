@@ -8,6 +8,24 @@
 # called with `disarm-and-verify` as $1 (see below).
 set -euo pipefail
 
+# Fails CLOSED: echoes "unknown" (not "absent") when the labels API call itself fails, so a
+# transient failure can't be silently read as "the label isn't there." A bare `grep` against
+# a command substitution that failed and produced empty output is indistinguishable from a
+# confirmed-empty label list -- every call site below must treat "unknown" the same as (or
+# more conservatively than) "present," never the same as "absent."
+label_state() {
+  local label="$1" labels
+  if ! labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' 2>/dev/null); then
+    echo "unknown"
+    return
+  fi
+  if grep -qxF "$label" <<< "$labels"; then
+    echo "present"
+  else
+    echo "absent"
+  fi
+}
+
 dequeue_and_disarm() {
   gh pr merge "$PR_URL" --disable-auto >/dev/null 2>&1 || true
   OWNER_PART="${REPO%%/*}"; NAME_PART="${REPO##*/}"
@@ -81,8 +99,10 @@ needs_review_is_stale() {
   # without generating a fresh `labeled` timeline event at all (attaching an
   # already-present label is a no-op event-wise), which would otherwise let this function
   # read the OLD labeled event/an unrelated marker as proof of staleness and clear a pause
-  # that's still the classifier's own live decision.
-  if grep -qxF "major-update" <<< "$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+  # that's still the classifier's own live decision. Fail closed on "unknown" too (the API
+  # call itself failed) -- treat it the same as "present," not "absent": an unconfirmed
+  # label state must not let this function conclude the pause is safe to clear.
+  if [ "$(label_state major-update)" != "absent" ]; then
     return 1
   fi
   return 0
@@ -99,9 +119,12 @@ attempt_admission() {
     # actual positive signal for "this classifier decided it needs review" -- check its
     # CURRENT presence directly and independently of any needs-review staleness logic
     # above, so even if that logic were ever wrong about needs-review specifically, a live
-    # major-update label still blocks arming here.
-    if grep -qxF "major-update" <<< "$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
-      echo "::notice::PR #$PR is a Dependabot PR currently labeled major-update -- standing down without arming regardless of the 'auto-merge' check-run's own conclusion."
+    # major-update label still blocks arming here. Fail closed on "unknown" (the labels API
+    # call itself failed) the same as "present" -- an unconfirmed label state must not let
+    # this fall through to arming a possibly-major bump.
+    major_update_state=$(label_state major-update)
+    if [ "$major_update_state" != "absent" ]; then
+      echo "::notice::PR #$PR is a Dependabot PR whose major-update label state is '${major_update_state}' -- standing down without arming regardless of the 'auto-merge' check-run's own conclusion."
       return 0
     fi
     auto_merge_conclusion=$(gh api "repos/${REPO}/commits/${PR_HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
