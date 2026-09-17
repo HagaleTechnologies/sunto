@@ -218,6 +218,19 @@ needs_human_is_stale() {
   if [ "$(label_state major-update)" != "absent" ]; then
     return 1
   fi
+  # Same fix as auto-merge-once.sh's needs_review_is_stale(): defer clearing until the
+  # CURRENT head's Dependabot classification has actually completed, not just checked
+  # major-update's state right now -- the check above only sees what's true at THIS
+  # instant, but dependabot-auto-merge.yml's classify job can still be in flight for the
+  # exact head being evaluated here. Scoped to Dependabot PRs specifically.
+  if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+    local auto_merge_status
+    auto_merge_status=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .status // "absent"' 2>/dev/null)
+    if [ -z "$auto_merge_status" ] || [ "$auto_merge_status" != "completed" ]; then
+      echo "::notice::PR #$PR's Dependabot classify check-run status is '${auto_merge_status:-unknown}', not completed -- treating needs-review as not-yet-safe to clear until classification of the current head finishes."
+      return 1
+    fi
+  fi
   return 0
 }
 

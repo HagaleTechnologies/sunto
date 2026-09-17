@@ -107,6 +107,29 @@ needs_review_is_stale() {
   if [ "$(label_state major-update)" != "absent" ]; then
     return 1
   fi
+  # Defer clearing until the CURRENT head's Dependabot classification has actually
+  # completed, not just checked major-update's state right now -- the check above only
+  # sees what's true at THIS instant, but dependabot-auto-merge.yml's classify job can
+  # still be in flight (the same synchronize event, running concurrently with this one),
+  # about to attach major-update+needs-review for the exact head being evaluated here.
+  # If this function concludes "stale, safe to clear" while that's still pending, the
+  # classifier's own write can land moments later as a needs-review no-op (already
+  # cleared by us) while major-update lands fresh -- and since attempt_admission()
+  # deliberately no longer gates on major-update (only on needs-review, to preserve the
+  # documented approval path), nothing would stop the resulting arm. Scoped to Dependabot
+  # PRs specifically -- there's no classifier in flight for any other author.
+  if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+    local live_head_sha
+    live_head_sha=$(gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq .headRefOid 2>/dev/null)
+    if [ -z "$live_head_sha" ]; then
+      return 1
+    fi
+    auto_merge_status=$(gh api "repos/${REPO}/commits/${live_head_sha}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .status // "absent"' 2>/dev/null)
+    if [ -z "$auto_merge_status" ] || [ "$auto_merge_status" != "completed" ]; then
+      echo "::notice::PR #$PR's Dependabot classify check-run status is '${auto_merge_status:-unknown}', not completed -- treating needs-review as not-yet-safe to clear until classification of the current head finishes."
+      return 1
+    fi
+  fi
   return 0
 }
 
