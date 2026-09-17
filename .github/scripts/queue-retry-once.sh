@@ -42,16 +42,6 @@ label_state() {
 # gate on `steps.retry.conclusion == 'success'` then correctly withholds the dedup
 # marker, leaving the attempt eligible for a rerun to actually deliver the signal.
 attach_needs_human_or_fail() {
-  # Recorded BEFORE the create/POST below: if needs-review was already attached by
-  # a human manually (auto-merge-trigger.yml's own `labeled` handling supports
-  # that), this helper isn't the true provenance owner and must not post its own
-  # SHA marker below, or the shared staleness classifier would misattribute
-  # someone else's still-valid pause to this fail-closed branch and auto-clear it
-  # on the next push.
-  local labels_before already_present
-  labels_before=$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name')
-  already_present=$(grep -qxF "needs-review" <<< "$labels_before" && echo true || echo false)
-
   # GH_TOKEN="$READ_TOKEN" on the create call too: this step's default GH_TOKEN is
   # CODEX_REVIEW_PAT, not github.token -- and the scenario that lands us in a
   # fail-closed branch calling this helper in the first place can be EXACTLY
@@ -74,8 +64,24 @@ attach_needs_human_or_fail() {
     # this fails to post, staleness detection just stays conservative (keeps
     # pausing), the same safe default as before this feature existed.
     #
-    # Marker omitted when the label pre-existed -- this call didn't establish the
-    # pause and must not claim provenance over it.
+    # Determined by the label's own most recent labeled event's ACTOR, read AFTER
+    # attachment -- not a before-snapshot read before the create/POST above. A
+    # before/after presence check has a real race: if needs-review gets attached
+    # by a human (or another producer) between an early snapshot and this helper's
+    # own create/POST call, that call becomes a silent no-op (GitHub only fires a
+    # `labeled` event on an absent->present transition), but an early snapshot
+    # would still read "wasn't there yet" and wrongly conclude this call owns the
+    # pause. This helper's own create/POST calls authenticate as READ_TOKEN
+    # (github.token / github-actions[bot]) -- if the most recent labeled event was
+    # caused by anything else, provenance must not be claimed over it.
+    local last_labeled_actor already_present
+    last_labeled_actor=$(GH_TOKEN="$READ_TOKEN" gh api --paginate --slurp "repos/$REPO/issues/${PR}/timeline" \
+      --jq '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null)
+    if [ -z "$last_labeled_actor" ] || [ "$last_labeled_actor" != "github-actions[bot]" ]; then
+      already_present=true
+    else
+      already_present=false
+    fi
     if [ "$already_present" = "true" ]; then
       GH_TOKEN="$READ_TOKEN" gh pr comment "$PR" --repo "$REPO" --body "needs-review was already attached before this fail-closed path ran (from another source) -- not claiming provenance over it; the existing pause stands as-is." >/dev/null 2>&1 || true
     else

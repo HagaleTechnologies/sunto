@@ -460,15 +460,6 @@ jobs:
           # timeline event. Posting the marker comment BEFORE the label attach would
           # guarantee the marker always predates that event, so the staleness check could
           # never treat it as trustworthy.
-          #
-          # Recorded BEFORE the create/POST below: if needs-review was already attached by
-          # another producer (a manual attach via auto-merge-trigger.yml's `labeled`
-          # handling), the POST here is idempotent and generates no fresh `labeled`
-          # timeline event -- this handoff isn't the true provenance owner of the existing
-          # pause.
-          labels_before=$(gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name')
-          already_present=$(grep -qxF "needs-review" <<< "$labels_before" && echo true || echo false)
-
           gh label create needs-review --color d73a4a \
             --description "Needs a human decision -- an automated handler could not safely proceed" \
             --repo "$REPO" >/dev/null 2>&1 || true
@@ -478,6 +469,29 @@ jobs:
           if [ "$attached" != "true" ]; then
             echo "::error::Could not attach needs-review to PR #$PR (commit $HEAD_SHA12) -- failing this step so the attempt isn't marked handled."
             exit 1
+          fi
+
+          # Determined by the label's own most recent `labeled` timeline event's ACTOR, read
+          # AFTER attachment -- not a labels-list snapshot read BEFORE it. A before/after
+          # presence check has a real race: if a maintainer manually applies needs-review
+          # between the "before" read and this step's own create/POST call above, the
+          # maintainer's action is what actually attaches the label (GitHub only fires a
+          # `labeled` event on a genuine absent->present transition; this step's own POST is
+          # then a silent no-op), but a before-snapshot taken too early would still read
+          # "wasn't there yet" and wrongly conclude THIS handoff owns the pause -- posting a
+          # provenance marker over a human's own manual decision, which a later push could
+          # then auto-clear as "stale" without ever having gone through this handler's actual
+          # recovery flow. Checking the actor closes this precisely: this step's own
+          # create/POST calls authenticate as github.token (github-actions[bot]) -- if the
+          # most recent labeled event was caused by anything else (a human's UI action, or a
+          # different token/identity), it is NOT this handoff's own attachment regardless of
+          # timing, and provenance must not be claimed over it.
+          last_labeled_actor=$(gh api --paginate --slurp "repos/$REPO/issues/${PR}/timeline" \
+            --jq '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null)
+          if [ -z "$last_labeled_actor" ] || [ "$last_labeled_actor" != "github-actions[bot]" ]; then
+            already_present=true
+          else
+            already_present=false
           fi
 
           if [ "$already_present" = "true" ]; then
@@ -595,17 +609,13 @@ jobs:
               fi
             fi
 
-            # Recorded BEFORE the create/POST below, same reasoning as the normal handoff
-            # path above: if needs-review was already attached by another producer (a
-            # manual attach, or auto-merge-trigger.yml's own `labeled` handling), this
-            # fallback isn't the true provenance owner of the existing pause and must not
-            # post a marker claiming it is -- the staleness detector in auto-merge-once.sh
-            # trusts a bot marker posted after the label's latest `labeled` event, so an
-            # unconditional marker here would let a NEXT push treat someone else's manual
-            # pause as this handler's own and clear it.
-            labels_before_fallback=$(gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name')
-            already_present_fallback=$(grep -qxF "needs-review" <<< "$labels_before_fallback" && echo true || echo false)
-
+            # Same reasoning as the normal handoff path above: if needs-review was already
+            # attached by another producer (a manual attach, or auto-merge-trigger.yml's own
+            # `labeled` handling), this fallback isn't the true provenance owner of the
+            # existing pause and must not post a marker claiming it is -- the staleness
+            # detector in auto-merge-once.sh trusts a bot marker posted after the label's
+            # latest `labeled` event, so an unconditional marker here would let a NEXT push
+            # treat someone else's manual pause as this handler's own and clear it.
             gh label create needs-review --color d73a4a \
               --description "Needs a human decision -- an automated handler could not safely proceed" \
               --repo "$REPO" >/dev/null 2>&1 || true
@@ -614,6 +624,18 @@ jobs:
             if ! grep -qxF "needs-review" <<< "$existing_labels"; then
               echo "::error::Could not attach needs-review to PR #$PR."
               exit 1
+            fi
+
+            # Determined by the label's own most recent labeled event's ACTOR, read AFTER
+            # attachment -- not a before-snapshot read before it (see the normal handoff
+            # path's own comment above for the full race this closes). This step's own
+            # create/POST calls authenticate as github.token (github-actions[bot]).
+            last_labeled_actor_fallback=$(gh api --paginate --slurp "repos/$REPO/issues/${PR}/timeline" \
+              --jq '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-review")] | if length > 0 then (last | .actor.login) else "" end' 2>/dev/null)
+            if [ -z "$last_labeled_actor_fallback" ] || [ "$last_labeled_actor_fallback" != "github-actions[bot]" ]; then
+              already_present_fallback=true
+            else
+              already_present_fallback=false
             fi
 
             if [ "$already_present_fallback" = "true" ]; then
