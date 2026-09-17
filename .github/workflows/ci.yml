@@ -152,9 +152,9 @@ jobs:
     # `if: needs.codex-clean.result == 'success' || ... == 'skipped'` --
     # the latter would make GitHub report a genuine codex-clean FAILURE
     # (poll timeout, non-404 bootstrap fetch error) as a job-level
-    # `skipped` check-run conclusion, which .mergify.yml's queue condition
-    # (`check-success = test`) cannot distinguish from a legitimate skip --
-    # letting a real gate failure silently auto-queue and merge with tests
+    # `skipped` check-run conclusion for this required check, indistinguishable
+    # from a legitimate skip to anything reading it from the outside --
+    # letting a real gate failure silently satisfy admission with tests
     # never run. `!cancelled()` rather than `always()`: the latter also
     # evaluates true when the workflow run itself was cancelled (e.g. by
     # this workflow's `concurrency: cancel-in-progress: true` superseding
@@ -168,7 +168,7 @@ jobs:
         run: |
           result="${{ needs.codex-clean.result }}"
           if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing test explicitly so Mergify's check-skipped tolerance in .mergify.yml can't mistake this for a legitimate skip and auto-merge past a real gate failure."
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing test explicitly so a genuine gate failure can't be mistaken for a legitimate skip and admitted past this required check."
             exit 1
           fi
       - uses: actions/checkout@v7
