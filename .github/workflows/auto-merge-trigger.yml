@@ -117,8 +117,20 @@ jobs:
       # CODEX_REVIEW_PAT, not GITHUB_TOKEN: a merge attributed to GITHUB_TOKEN suppresses
       # downstream push-triggered events (GitHub's anti-recursion guard) -- any push-triggered
       # workflow needs to fire for a queue-merged commit exactly like any other push to main.
+      #
+      # ref: main, explicit -- NOT the implicit default. actions/checkout's default ref for a
+      # pull_request_target event tracks the PR's CURRENT base (github.sha for this trigger is
+      # the base branch's own tip, not the PR's head) -- for the exact base-retarget `edited`
+      # event this job's disarm logic exists to handle, that base is, by definition, whatever
+      # the PR was JUST retargeted to, not main. An implicit checkout would fetch THAT branch's
+      # tree instead, which may not carry .github/scripts/auto-merge-once.sh at all (it only
+      # exists on main after this PR merges) -- failing the very first step of the disarm
+      # attempt before it runs anything. Pinning to main guarantees the trusted, known-good
+      # copy of the handler is what actually executes, regardless of what the PR's live base
+      # currently is.
       - uses: actions/checkout@v7
         with:
+          ref: main
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
       - name: Handle a manual needs-review label/unlabel event
