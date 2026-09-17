@@ -285,19 +285,16 @@ current_base=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "$REPO" --json bas
 # very first fetch" edge case unprotected either way. Trusting that debounce here, same as
 # the original design before round 2, is the better trade-off for the common case.
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
-  # 'success' on the auto-merge check-run only means dependabot-auto-merge.yml's classify
-  # job ran without erroring -- it reports success on BOTH its minor/patch and major-update
-  # branches, so it's never proof by itself that this head isn't a major bump. major-update
-  # is the actual positive signal; check its CURRENT presence directly, independent of the
-  # staleness guard above (belt and suspenders against the exact same collapse-to-false gap
-  # auto-merge-once.sh's attempt_admission() closes the same way). Fail closed on "unknown"
-  # too (the labels API call itself failed) -- treat it the same as "present."
-  if [ "$(label_state major-update)" != "absent" ]; then
-    head_authorized=false
-  else
-    auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
-    head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
-  fi
+  # NOT gated on major-update here, deliberately -- see auto-merge-once.sh's
+  # attempt_admission() for the full reasoning: sunto's original .mergify.yml only ever
+  # gated admission on needs-review, treating major-update as a purely descriptive
+  # classification label. Gating here too broke the documented approval path (a maintainer
+  # removing only needs-review), since dependabot-auto-merge.yml never removes major-update
+  # itself. major-update is still checked -- inside needs_human_is_stale() above -- to stop
+  # THAT function's own staleness-clearing logic from auto-clearing a pause the classifier
+  # still actively wants; that's a narrower, different concern than gating here a second time.
+  auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
+  head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
 else
   head_authorized=true
 fi

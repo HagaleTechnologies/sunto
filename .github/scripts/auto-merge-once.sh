@@ -112,21 +112,18 @@ needs_review_is_stale() {
 # gate, then the merge call itself, pinned to the exact head this decision was made against.
 attempt_admission() {
   if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
-    # 'success' on the auto-merge check-run means dependabot-auto-merge.yml's classify job
-    # RAN without erroring -- it reports success on BOTH branches of its own if/else (the
-    # minor/patch auto-approve path AND the major-update label-for-review path), so it is
-    # NOT, by itself, evidence this revision is a minor/patch bump. major-update is the
-    # actual positive signal for "this classifier decided it needs review" -- check its
-    # CURRENT presence directly and independently of any needs-review staleness logic
-    # above, so even if that logic were ever wrong about needs-review specifically, a live
-    # major-update label still blocks arming here. Fail closed on "unknown" (the labels API
-    # call itself failed) the same as "present" -- an unconfirmed label state must not let
-    # this fall through to arming a possibly-major bump.
-    major_update_state=$(label_state major-update)
-    if [ "$major_update_state" != "absent" ]; then
-      echo "::notice::PR #$PR is a Dependabot PR whose major-update label state is '${major_update_state}' -- standing down without arming regardless of the 'auto-merge' check-run's own conclusion."
-      return 0
-    fi
+    # NOT gated on major-update here, deliberately -- only on needs-review (via the
+    # merge_queue_live/base/needs-review flow this function is reached through). This
+    # matches sunto's original .mergify.yml exactly: major-update was always a purely
+    # DESCRIPTIVE classification label, never an independent admission condition of its
+    # own -- the documented approval path for a major bump is a maintainer reviewing it and
+    # removing ONLY needs-review, leaving major-update in place as a historical marker. An
+    # earlier version of this check also gated on major-update directly, which broke that
+    # exact path: dependabot-auto-merge.yml never removes major-update itself, so a
+    # maintainer's approval could never actually un-stick the PR. major-update is still
+    # checked -- inside needs_review_is_stale() above -- to stop this function's OWN
+    # staleness-clearing logic from auto-clearing a pause the classifier still actively
+    # wants; that's a different, narrower concern than gating admission here a second time.
     auto_merge_conclusion=$(gh api "repos/${REPO}/commits/${PR_HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
     if [ "$auto_merge_conclusion" != "success" ]; then
       echo "::notice::PR #$PR is a Dependabot PR whose 'auto-merge' check-run is '${auto_merge_conclusion}', not success -- standing down without arming (classify workflow hasn't vetted this revision, or vetted it as needing review)."
