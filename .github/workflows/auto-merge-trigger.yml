@@ -32,7 +32,17 @@ name: Auto-Merge Trigger
 # event occurs just because a sibling workflow finished.
 on:
   pull_request_target:
-    branches: [main]
+    # No `branches: [main]` filter, deliberately: that filter is evaluated against the PR's
+    # CURRENT base at delivery time, so a retarget FROM main TO some other branch (an
+    # `edited` event whose new base isn't main) would be excluded before this workflow ever
+    # ran at all -- meaning an already-armed PR retargeted away from main by anyone with
+    # write access could stay armed/queued with none of main's gating applying to its new
+    # base, and this workflow would never even see the event to disarm it. Scoping to main
+    # happens at runtime instead, inside attempt_admission()'s own current_base check (which
+    # now disarms, not just declines to arm, when the live base isn't main) -- the cost is
+    # this job also runs harmlessly (and stands down immediately) for PRs that target some
+    # other branch entirely, never armed in the first place.
+    #
     # unlabeled/labeled (needs-review only, scoped in the job's own if: below): a maintainer
     # manually applying or removing needs-review as an out-of-band pause needs to reach this
     # job the same way an opened/synchronize event does, or the visible pause/resume signal is

@@ -73,6 +73,18 @@ needs_review_is_stale() {
   [ -z "$recorded_sha12" ] && return 1
   [[ "$marker_created_at" < "$last_labeled_at" ]] && return 1
   [ "$recorded_sha12" = "$current_head_sha12" ] && return 1
+  # dependabot-auto-merge.yml's own classify step co-applies major-update alongside
+  # needs-review for a major bump, and never removes it on a later push -- if it's still
+  # present, needs-review is (at minimum also) the classifier's own pause, not solely a
+  # queue-retry-handler marker-tracked one, regardless of what the provenance check above
+  # concluded. A concurrent synchronize can reclassify the SAME major bump on a new head
+  # without generating a fresh `labeled` timeline event at all (attaching an
+  # already-present label is a no-op event-wise), which would otherwise let this function
+  # read the OLD labeled event/an unrelated marker as proof of staleness and clear a pause
+  # that's still the classifier's own live decision.
+  if grep -qxF "major-update" <<< "$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+    return 1
+  fi
   return 0
 }
 
@@ -80,6 +92,18 @@ needs_review_is_stale() {
 # gate, then the merge call itself, pinned to the exact head this decision was made against.
 attempt_admission() {
   if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+    # 'success' on the auto-merge check-run means dependabot-auto-merge.yml's classify job
+    # RAN without erroring -- it reports success on BOTH branches of its own if/else (the
+    # minor/patch auto-approve path AND the major-update label-for-review path), so it is
+    # NOT, by itself, evidence this revision is a minor/patch bump. major-update is the
+    # actual positive signal for "this classifier decided it needs review" -- check its
+    # CURRENT presence directly and independently of any needs-review staleness logic
+    # above, so even if that logic were ever wrong about needs-review specifically, a live
+    # major-update label still blocks arming here.
+    if grep -qxF "major-update" <<< "$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+      echo "::notice::PR #$PR is a Dependabot PR currently labeled major-update -- standing down without arming regardless of the 'auto-merge' check-run's own conclusion."
+      return 0
+    fi
     auto_merge_conclusion=$(gh api "repos/${REPO}/commits/${PR_HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
     if [ "$auto_merge_conclusion" != "success" ]; then
       echo "::notice::PR #$PR is a Dependabot PR whose 'auto-merge' check-run is '${auto_merge_conclusion}', not success -- standing down without arming (classify workflow hasn't vetted this revision, or vetted it as needing review)."
@@ -97,7 +121,17 @@ attempt_admission() {
   fi
   current_base=$(gh pr view "$PR" --repo "${REPO}" --json baseRefName --jq .baseRefName)
   if [ "$current_base" != "main" ]; then
-    echo "::notice::PR #$PR's base is '$current_base' (not main) as of this mutation attempt -- standing down without arming."
+    # Disarm, don't just decline to arm: a PR that was already armed/queued while
+    # targeting main, then retargeted away by anyone with write access, must not stay
+    # armed against a base where main's merge_queue rule and required checks don't apply
+    # -- an ordinary direct merge could otherwise slip through on the new base entirely
+    # outside this repo's gating. Verified the same way every other disarm path here is.
+    echo "::notice::PR #$PR's base is '$current_base' (not main) as of this mutation attempt -- disarming/dequeuing rather than just declining to arm, in case it was already armed while still targeting main."
+    dequeue_and_disarm
+    if still_armed_or_queued; then
+      echo "::error::Could not fully disarm PR #$PR after its base changed away from main -- refusing to report success while it remains armed or queued. Disarm by hand and confirm." >&2
+      exit 1
+    fi
     return 0
   fi
   # --match-head-commit: without it, a Dependabot PR pushed AFTER PR_HEAD_SHA was captured
