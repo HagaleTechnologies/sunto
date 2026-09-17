@@ -49,7 +49,17 @@ permissions:
   checks: read
 
 jobs:
-  auto-merge:
+  # `enable-auto-merge`, not `auto-merge`: dependabot-auto-merge.yml's own job is ALSO named
+  # `auto-merge` (its job id, with no explicit `name:` override, same as this job originally
+  # had) -- both would otherwise produce a check-run literally named "auto-merge" on the same
+  # commit. attempt_admission()'s Dependabot branch (in auto-merge-once.sh) and
+  # queue-retry-once.sh's trusted-author reauthorization both select check-runs by that exact
+  # name to read the classifier's verdict -- a name collision meant either query could pick up
+  # THIS job's own (unrelated) check-run instead and misread it as "classifier says this
+  # Dependabot PR is vetted," potentially arming an unclassified/major bump. Renaming this job
+  # (not dependabot-auto-merge.yml's, which is out of scope for this migration) resolves the
+  # collision at the source, for every consumer of that check-run name at once.
+  enable-auto-merge:
     # `edited` scoped to a real base retarget only: `edited` fires on ANY PR edit (title, body,
     # labels, base), but this job calls `gh pr merge` unconditionally for it, which could re-arm
     # an unchanged head that just failed merge-group CI for reasons having nothing to do with
