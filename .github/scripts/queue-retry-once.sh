@@ -84,10 +84,23 @@ attach_needs_human_or_fail() {
     fi
     if [ "$already_present" = "true" ]; then
       GH_TOKEN="$READ_TOKEN" gh pr comment "$PR" --repo "$REPO" --body "needs-review was already attached before this fail-closed path ran (from another source) -- not claiming provenance over it; the existing pause stands as-is." >/dev/null 2>&1 || true
-    else
-      GH_TOKEN="$READ_TOKEN" gh pr comment "$PR" --repo "$REPO" --body "<!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" >/dev/null 2>&1 || true
+      return 0
     fi
-    return 0
+    # Verified by the POST's own response, not `|| true`-and-forget: same fix as
+    # queue-retry-handler.yml's own handoff step -- if this comment fails to post, the
+    # label attached above has NO SHA provenance marker at all, so a later corrective
+    # push can never prove the pause is stale and stays blocked until a human manually
+    # removes the label. `gh api --method POST` directly (not `gh pr comment`), reading
+    # the new comment's own `.id` from the response, since this SHA can already carry an
+    # older marker from a previous cycle that a text-only re-scan could mistake for proof
+    # this specific post succeeded.
+    local new_comment_id
+    if new_comment_id=$(GH_TOKEN="$READ_TOKEN" gh api --method POST "repos/$REPO/issues/${PR}/comments" -f body="<!-- queue-retry-handler:needs-review sha=$HEAD_SHA12 -->" --jq '.id' 2>/dev/null) \
+      && [ -n "$new_comment_id" ] && [ "$new_comment_id" != "null" ]; then
+      return 0
+    fi
+    echo "::error::Could not confirm the SHA provenance marker comment landed for PR #$PR (commit $HEAD_SHA12) -- failing so this attempt isn't marked handled." >&2
+    return 1
   fi
   echo "::error::Could not attach needs-review to PR #$PR -- the handoff comment posted, but the label signal did not land."
   return 1
