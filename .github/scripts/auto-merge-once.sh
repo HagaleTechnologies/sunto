@@ -88,9 +88,31 @@ needs_review_is_stale() {
   return 0
 }
 
-# The actual admission attempt -- author/classification gate, merge_queue-live gate, base
-# gate, then the merge call itself, pinned to the exact head this decision was made against.
+# The actual admission attempt -- base-retarget disarm FIRST (unconditional), then
+# author/classification gate, merge_queue-live gate, then the merge call itself, pinned to
+# the exact head this decision was made against.
 attempt_admission() {
+  # Checked and acted on BEFORE the author gate below, deliberately: an outside
+  # contributor's PR that was manually armed (a maintainer ran `gh pr merge --auto` by
+  # hand, or an earlier revision was thagale-authored before some retarget-adjacent state
+  # changed -- any path that isn't this script's own admission logic) can still be armed
+  # or queued when a later event reaches this function with an author this gate would
+  # normally reject. If the base-retarget disarm lived after an early `return 0` from the
+  # author check (as it originally did), a PR in exactly that state -- untrusted author,
+  # armed, retargeted away from main -- would hit the author check's early return and
+  # NEVER reach the disarm logic at all, leaving it armed/queued against a base where
+  # main's merge_queue rule and required checks don't apply.
+  current_base=$(gh pr view "$PR" --repo "${REPO}" --json baseRefName --jq .baseRefName)
+  if [ "$current_base" != "main" ]; then
+    echo "::notice::PR #$PR's base is '$current_base' (not main) as of this mutation attempt -- disarming/dequeuing rather than just declining to arm, in case it was already armed while still targeting main. Checked before any author/classification gate below, so this runs even for a PR this function would otherwise refuse to arm on its own."
+    dequeue_and_disarm
+    if still_armed_or_queued; then
+      echo "::error::Could not fully disarm PR #$PR after its base changed away from main -- refusing to report success while it remains armed or queued. Disarm by hand and confirm." >&2
+      exit 1
+    fi
+    return 0
+  fi
+
   if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
     # 'success' on the auto-merge check-run means dependabot-auto-merge.yml's classify job
     # RAN without erroring -- it reports success on BOTH branches of its own if/else (the
@@ -117,21 +139,6 @@ attempt_admission() {
   merge_queue_live=$(gh api "repos/${REPO}/rules/branches/main" --jq '[.[] | select(.type == "merge_queue")] | length > 0' 2>/dev/null || echo false)
   if [ "$merge_queue_live" != "true" ]; then
     echo "::notice::No merge_queue ruleset rule exists yet for main -- standing down without arming native auto-merge on PR #$PR. Mergify's own queue is still the sole merge authority until the ruleset write lands."
-    return 0
-  fi
-  current_base=$(gh pr view "$PR" --repo "${REPO}" --json baseRefName --jq .baseRefName)
-  if [ "$current_base" != "main" ]; then
-    # Disarm, don't just decline to arm: a PR that was already armed/queued while
-    # targeting main, then retargeted away by anyone with write access, must not stay
-    # armed against a base where main's merge_queue rule and required checks don't apply
-    # -- an ordinary direct merge could otherwise slip through on the new base entirely
-    # outside this repo's gating. Verified the same way every other disarm path here is.
-    echo "::notice::PR #$PR's base is '$current_base' (not main) as of this mutation attempt -- disarming/dequeuing rather than just declining to arm, in case it was already armed while still targeting main."
-    dequeue_and_disarm
-    if still_armed_or_queued; then
-      echo "::error::Could not fully disarm PR #$PR after its base changed away from main -- refusing to report success while it remains armed or queued. Disarm by hand and confirm." >&2
-      exit 1
-    fi
     return 0
   fi
   # --match-head-commit: without it, a Dependabot PR pushed AFTER PR_HEAD_SHA was captured

@@ -76,13 +76,19 @@ jobs:
     # that edit. `changes.base` is present on the edited event's payload only when the base
     # branch itself changed.
     #
-    # A matching `labeled`/`unlabeled` event (needs-review only) bypasses the author allowlist
-    # below -- queue-retry-handler.yml retries an already-admitted PR the same way regardless of
-    # author, and a needs-review pause/resume on one of those PRs needs to reach this job the
-    # same as an allowlisted one's. Coarse author check here is the webhook-delivery-time
-    # snapshot (good enough to skip obviously-ineligible PRs cheaply); the Dependabot branch's
-    # finer check-success=auto-merge condition is re-verified live inside auto-merge-once.sh,
-    # since a job-level `if:` cannot evaluate a check-run's live conclusion.
+    # A matching `labeled`/`unlabeled` event (needs-review only), OR a real base-retarget
+    # `edited` event, bypasses the author allowlist below. The retarget case matters just as
+    # much as the label case: this job's OWN check tests the PR's AUTHOR, not who performed
+    # the edit -- an outside contributor's PR (never eligible to arm on its own) can still
+    # have been manually armed by someone with write access, then retargeted away from main
+    # by anyone with write access too. Without this bypass, that retarget event would never
+    # even start this job at all, so attempt_admission()'s own base-retarget disarm logic
+    # (which now runs before its author gate, for exactly this reason) would never run either
+    # -- the two fixes only work together. Coarse author check here is the
+    # webhook-delivery-time snapshot (good enough to skip obviously-ineligible PRs cheaply);
+    # the Dependabot branch's finer check-success=auto-merge condition is re-verified live
+    # inside auto-merge-once.sh, since a job-level `if:` cannot evaluate a check-run's live
+    # conclusion.
     if: |
       github.event_name == 'pull_request_target' &&
       github.event.pull_request.draft == false &&
@@ -92,6 +98,7 @@ jobs:
       (
         (github.event.action == 'labeled' && github.event.label.name == 'needs-review') ||
         (github.event.action == 'unlabeled' && github.event.label.name == 'needs-review') ||
+        (github.event.action == 'edited' && github.event.changes.base != null) ||
         (
           github.event.pull_request.user.login == 'thagale' ||
           github.event.pull_request.user.login == 'dependabot[bot]'

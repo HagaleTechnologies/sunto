@@ -185,6 +185,16 @@ needs_human_is_stale() {
   [ -z "$recorded_sha12" ] && return 1
   [[ "$marker_created_at" < "$last_labeled_at" ]] && return 1
   [ "$recorded_sha12" = "$current_head_sha12" ] && return 1
+  # Same guard as auto-merge-once.sh's needs_review_is_stale(): dependabot-auto-merge.yml
+  # co-applies major-update alongside needs-review for a major bump and never removes it, so
+  # if it's still present, needs-review is (at minimum also) the classifier's own live pause
+  # regardless of what the marker-provenance checks above concluded -- a concurrent
+  # reclassification onto a new head can re-attach an already-present needs-review with no
+  # fresh `labeled` timeline event at all, which would otherwise let this function clear a
+  # pause the classifier still actively wants.
+  if grep -qxF "major-update" <<< "$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+    return 1
+  fi
   return 0
 }
 
@@ -247,8 +257,18 @@ current_base=$(GH_TOKEN="$READ_TOKEN" gh pr view "$PR" --repo "$REPO" --json bas
 # and attempt_admission() apply: thagale, or a Dependabot PR whose 'auto-merge'
 # check-run on THIS EXACT head is green.
 if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
-  auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
-  head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
+  # 'success' on the auto-merge check-run only means dependabot-auto-merge.yml's classify
+  # job ran without erroring -- it reports success on BOTH its minor/patch and major-update
+  # branches, so it's never proof by itself that this head isn't a major bump. major-update
+  # is the actual positive signal; check its CURRENT presence directly, independent of the
+  # staleness guard above (belt and suspenders against the exact same collapse-to-false gap
+  # auto-merge-once.sh's attempt_admission() closes the same way).
+  if grep -qxF "major-update" <<< "$(GH_TOKEN="$READ_TOKEN" gh api --paginate "repos/$REPO/issues/${PR}/labels" --jq '.[].name' 2>/dev/null)"; then
+    head_authorized=false
+  else
+    auto_merge_conclusion=$(GH_TOKEN="$READ_TOKEN" gh api "repos/${REPO}/commits/${HEAD_SHA}/check-runs" --jq '[.check_runs[] | select(.name == "auto-merge")] | last | .conclusion // "absent"' 2>/dev/null || echo "absent")
+    head_authorized=$([ "$auto_merge_conclusion" = "success" ] && echo true || echo false)
+  fi
 elif [ "$PR_AUTHOR" = "thagale" ]; then
   head_authorized=true
 else
