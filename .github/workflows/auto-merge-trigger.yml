@@ -100,6 +100,10 @@ jobs:
           github.event.pull_request.user.login == 'dependabot[bot]'
         )
       )
+    # Q-0068: CODEX_REVIEW_PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     # Shared with queue-retry-handler.yml's own mutating job AND the retrigger job below --
     # closes a TOCTOU race where any one of these could read needs-review as absent and merge
@@ -201,6 +205,10 @@ jobs:
   retrigger-after-dependabot-classify:
     needs: [resolve-dependabot-pr]
     if: needs.resolve-dependabot-pr.outputs.pr_number != ''
+    # Q-0068: CODEX_REVIEW_PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     # Shares the SAME group auto-merge-trigger.yml's own main job uses (and
     # queue-retry-handler.yml's mutating job) -- real mutual exclusion against a concurrent
