@@ -142,14 +142,13 @@ jobs:
     # on every path this job handles, rather than depending on native job-skip/job-success
     # attribution. merge_group is not handled here (see codex-review-merge-group-passthrough).
     #
-    # Dependabot is excluded at the JOB level (not routed through the explicit-upsert
-    # path) -- GitHub withholds Actions secrets for Dependabot-triggered
-    # pull_request_target events, so the App-token mint step below would fail before ever
-    # reaching a Dependabot success branch (pancetta's own round-8/14/15 saga; sunto's
-    # own OLD file already excluded Dependabot at this same job level for this same
-    # documented reason, so this is a straight continuation, not a new decision).
+    # Dependabot PRs are NOT excluded: since Q-0068 the App-token mint reads its secrets
+    # from the main-only codex-review environment, which Dependabot-triggered
+    # pull_request_target runs receive (credenza's reusable codex-review-request.yml relies
+    # on the same). Excluding them left the required managed check unpublished, so no
+    # Dependabot PR could ever merge (sunto#29). They now get a normal Codex round.
     name: Codex review request (producer)
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false
     # Q-0068: secrets come from the main-only codex-review environment (pull_request_target
     # runs at main).
     environment:
@@ -340,10 +339,8 @@ jobs:
           }
 
           # Bootstrap not live yet, OR the label already exists: pass through
-          # immediately with a completed, successful check-run. Dependabot never reaches
-          # this step at all -- excluded at the job level (see the job's own header
-          # comment), since GitHub withholds secrets from Dependabot-triggered runs and this
-          # step needs the minted App token.
+          # immediately with a completed, successful check-run. Dependabot PRs take the
+          # normal path (see the job's own header comment).
           if [ "$BOOTSTRAP_STATUS" != "ready" ]; then
             conclusion="success"
           elif [ "$ALREADY_CLEAN" = "true" ]; then
